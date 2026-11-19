@@ -713,14 +713,11 @@ def main():
     app.add_error_handler(global_error_handler)
 
     print(f"Starting combined {BRAND} bot with extended Telegram timeouts...")
-    app.run_polling(drop_pending_updates=False, poll_interval=1, timeout=30)
-
+         webhook_path = os.getenv("WEBHOOK_PATH", "matrix-telegram")     webhook_secret = os.getenv("WEBHOOK_SECRET", "")     render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")     port = int(os.getenv("PORT", "10000"))      if not render_url or not webhook_secret:         raise SystemExit("RENDER_EXTERNAL_URL or WEBHOOK_SECRET missing")      app.run_webhook(         listen="0.0.0.0",         port=port,         url_path=webhook_path,         webhook_url=f"{render_url}/{webhook_path}",         secret_token=webhook_secret,         drop_pending_updates=False,         bootstrap_retries=-1,     )
 
 if __name__ == "__main__":
     try:
         asyncio.get_event_loop()
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
-
     main()
-    
