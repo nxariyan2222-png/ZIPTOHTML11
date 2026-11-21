@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # 𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈 — Telegram Website-to-ZIP & ZIP-to-HTML Bot
-# Fully Optimized for Render + Vite/React SPA Fixes (ImportMap + AssetMap)
 
 import asyncio
 import ipaddress
@@ -16,6 +15,7 @@ import base64
 import mimetypes
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urldefrag, unquote
+from urllib.request import Request
 from urllib.error import URLError
 from html.parser import HTMLParser
 
@@ -23,12 +23,12 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.request import HTTPXRequest
-from telegram.error import TimedOut, NetworkError, BadRequest
+from telegram.error import TimedOut, NetworkError, RetryAfter, BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 
 BRAND = "𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈"
 
-# --- ENVIRONMENT VARIABLES ---
+# --- ENVIRONMENT VARIABLES (Render se load honge) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "8959111543"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003636772569"))
@@ -195,7 +195,7 @@ def build_zip(start_url, zip_base, work_dir):
         time.sleep(0.03)
 
     if not saved:
-        raise RuntimeError("No public files could be downloaded.")
+        raise RuntimeError("No public files could be downloaded. The site may block requests.")
 
     readme = work / "MATRIX_MODS_INFO.txt"
     readme.write_text(f"{BRAND}\nWEBSITE TO ZIP BACKUP\n\nSource: {start_url}\nFiles: {len(saved)}\n", encoding="utf-8")
@@ -208,8 +208,13 @@ def build_zip(start_url, zip_base, work_dir):
         raise RuntimeError("ZIP is too large for Telegram (45 MB limit).")
     return zip_path, len(saved)
 
+def user_label(user):
+    name = " ".join(x for x in [user.first_name, user.last_name] if x) or "Not set"
+    username = f"@{user.username}" if user.username else "Not set"
+    return name, username
 
-# ================= ZIP TO HTML LOGIC =================
+
+# ================= ZIP TO HTML LOGIC (From Max2.py) =================
 def extract_project_zip(zip_path, root):
     total = 0
     with zipfile.ZipFile(zip_path) as zf:
@@ -272,6 +277,7 @@ class SingleHTMLInliner(HTMLParser):
         values = dict(attrs)
         tag_lower = tag.lower()
         
+        # 404 Fix: Ignore Vite modulepreload to prevent failed chunk loading
         if tag_lower == "link" and values.get("rel") == "modulepreload":
             return
 
@@ -283,7 +289,6 @@ class SingleHTMLInliner(HTMLParser):
                 return
             if asset and "icon" in values.get("rel", "").lower():
                 values["href"] = asset_data_uri(asset)
-                
         if tag_lower == "script" and values.get("src"):
             asset = local_asset(self.entry.parent, values["src"], self.root)
             if asset and asset.suffix.lower() in (".js", ".mjs"):
@@ -297,13 +302,11 @@ class SingleHTMLInliner(HTMLParser):
                 js_text = re.sub(r"</script", r"<\\/script", js_text, flags=re.I)
                 self.output.append("<script%s>\n%s\n</script>" % (attrs_text, js_text))
                 return
-                
         for attr in ("src", "poster"):
             if values.get(attr):
                 asset = local_asset(self.entry.parent, values[attr], self.root)
                 if asset:
                     values[attr] = asset_data_uri(asset)
-                    
         if values.get("srcset"):
             candidates = []
             for part in values["srcset"].split(","):
@@ -314,7 +317,6 @@ class SingleHTMLInliner(HTMLParser):
                         bits[0] = asset_data_uri(asset)
                     candidates.append(" ".join(bits))
             values["srcset"] = ", ".join(candidates)
-            
         attrs_text = "".join(
             (' %s="%s"' % (k, (v or "").replace("&", "&amp;").replace('"', "&quot;")))
             if v is not None else " " + k for k, v in values.items()
@@ -335,10 +337,9 @@ def convert_project_zip(zip_path, output_path):
         root = Path(td) / "project"
         root.mkdir()
         extract_project_zip(zip_path, root)
-        
         all_html = list(root.rglob("*.html")) + list(root.rglob("*.htm"))
         if not all_html:
-            raise ValueError("ZIP mein koi HTML page nahi mila. Vite/React project ko pehle 'npm run build' karke 'dist' folder ki zip banayein.")
+            raise ValueError("ZIP mein koi HTML page nahi mila. Pehle build karke dist folder ZIP karein.")
         
         def entry_rank(p):
             n = p.name.lower()
@@ -348,157 +349,91 @@ def convert_project_zip(zip_path, output_path):
         all_html.sort(key=entry_rank)
         entry = all_html[0]
         site_root = entry.parent.resolve()
+        parser = SingleHTMLInliner(entry.read_text("utf-8", errors="replace"), entry, site_root)
+        result = "".join(parser.output)
         
-        # 1. Build Asset Map for fetching images, json, fonts, etc dynamically
-        asset_map = {}
-        import_map = {}
-        
-        for file_path in root.rglob("*"):
-            if not file_path.is_file():
-                continue
-                
-            rel_path = file_path.relative_to(root).as_posix()
-            if rel_path.endswith(".html") or rel_path.endswith(".htm"):
-                continue
-                
-            b64 = base64.b64encode(file_path.read_bytes()).decode("ascii")
-            mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-            data_uri = f"data:{mime};base64,{b64}"
-            
-            paths = [rel_path, "/" + rel_path, "./" + rel_path, file_path.name, "./" + file_path.name]
-            
-            for p in paths:
-                asset_map[p] = data_uri
-                
-            # Register JS in ImportMap
-            if rel_path.endswith(".js") or rel_path.endswith(".mjs"):
-                js_data_uri = f"data:text/javascript;base64,{b64}"
-                for p in paths:
-                    import_map[p] = js_data_uri
-                    
-        import_map_tag = f'<script type="importmap">\n{json.dumps({"imports": import_map})}\n</script>\n' if import_map else ""
-        
-        # 2. Override fetch, XHR, Image to load local assets & Fix React Router
-        routing_fix = f"""
+        # --- 404 FIX (Router Hijack for React/Vue on Local File) ---
+        routing_fix = """
         <script>
-        window.__ASSET_MAP__ = {json.dumps(asset_map)};
-        
-        (function() {{
-            // Override Fetch
-            var origFetch = window.fetch;
-            window.fetch = function(input, init) {{
-                var url = typeof input === 'string' ? input : input.url;
-                if (window.__ASSET_MAP__ && window.__ASSET_MAP__[url]) {{
-                    return origFetch(window.__ASSET_MAP__[url], init);
-                }}
-                return origFetch.apply(this, arguments);
-            }};
-            
-            // Override XHR
-            var origXHR = window.XMLHttpRequest.prototype.open;
-            window.XMLHttpRequest.prototype.open = function(method, url, async, user, password) {{
-                if (window.__ASSET_MAP__ && window.__ASSET_MAP__[url]) {{
-                    arguments[1] = window.__ASSET_MAP__[url];
-                }}
-                return origXHR.apply(this, arguments);
-            }};
-
-            // Override Image Src (for dynamically loaded images)
-            try {{
-                var origImgSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
-                if (origImgSrc && origImgSrc.set) {{
-                    Object.defineProperty(HTMLImageElement.prototype, "src", {{
-                        set: function(val) {{
-                            if (window.__ASSET_MAP__ && window.__ASSET_MAP__[val]) {{
-                                origImgSrc.set.call(this, window.__ASSET_MAP__[val]);
-                            }} else {{
-                                origImgSrc.set.call(this, val);
-                            }}
-                        }},
-                        get: origImgSrc.get
-                    }});
-                }}
-            }} catch(e) {{}}
-
-            // React Router Fix
+        (function() {
             var isLocal = window.location.protocol === 'file:' || window.location.protocol === 'content:';
-            if (isLocal) {{
-                if (!window.location.hash) {{
-                    try {{ window.location.hash = '#/'; }} catch(e) {{}}
-                }}
-                try {{
+            if (isLocal) {
+                if (!window.location.hash) {
+                    try { window.location.hash = '#/'; } catch(e) {}
+                }
+                try {
                     var loc = window.location;
                     var proto = Object.getPrototypeOf(loc);
                     var pathnameDesc = Object.getOwnPropertyDescriptor(proto, 'pathname');
-                    if (pathnameDesc && pathnameDesc.get) {{
-                        Object.defineProperty(proto, 'pathname', {{
+                    if (pathnameDesc && pathnameDesc.get) {
+                        Object.defineProperty(proto, 'pathname', {
                             configurable: true,
-                            get: function() {{
+                            get: function() {
                                 var hash = window.location.hash;
-                                if (hash && hash.startsWith('#')) {{
+                                if (hash && hash.startsWith('#')) {
                                     var path = hash.substring(1);
                                     return path.startsWith('/') ? path : '/' + path;
-                                }}
+                                }
                                 return '/';
-                            }}
-                        }});
-                    }}
-                }} catch (e) {{}}
+                            }
+                        });
+                    }
+                } catch (e) {}
 
                 var origPush = history.pushState;
                 var origReplace = history.replaceState;
-                history.pushState = function(state, title, url) {{
-                    if (url && url.startsWith('/') && !url.startsWith('//')) {{
+                history.pushState = function(state, title, url) {
+                    if (url && url.startsWith('/') && !url.startsWith('//')) {
                         window.location.hash = url;
-                        window.dispatchEvent(new PopStateEvent('popstate', {{ state: state }}));
-                    }} else {{
+                        window.dispatchEvent(new PopStateEvent('popstate', { state: state }));
+                    } else {
                         origPush.apply(history, arguments);
-                    }}
-                }};
-                history.replaceState = function(state, title, url) {{
-                    if (url && url.startsWith('/') && !url.startsWith('//')) {{
+                    }
+                };
+                history.replaceState = function(state, title, url) {
+                    if (url && url.startsWith('/') && !url.startsWith('//')) {
                         var newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname + window.location.search + '#' + url;
-                        try {{ origReplace.call(history, state, title, newUrl); }} catch(e) {{}}
-                    }} else {{
+                        try { origReplace.call(history, state, title, newUrl); } catch(e) {}
+                    } else {
                         origReplace.apply(history, arguments);
-                    }}
-                }};
-                window.addEventListener('hashchange', function() {{
-                    window.dispatchEvent(new PopStateEvent('popstate', {{ state: null }}));
-                }});
-                document.addEventListener('click', function(e) {{
+                    }
+                };
+                window.addEventListener('hashchange', function() {
+                    window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+                });
+                document.addEventListener('click', function(e) {
                     var a = e.target.closest('a');
-                    if (a) {{
+                    if (a) {
                         var href = a.getAttribute('href');
-                        if (href && href.startsWith('/') && !href.startsWith('//')) {{
+                        if (href && href.startsWith('/') && !href.startsWith('//')) {
                             e.preventDefault();
                             window.location.hash = href;
-                        }}
-                    }}
-                }}, true);
-            }}
-        }})();
+                        }
+                    }
+                }, true);
+            }
+        })();
         </script>
         <base href="./">
         """
         
-        parser = SingleHTMLInliner(entry.read_text("utf-8", errors="replace"), entry, site_root)
-        result = "".join(parser.output)
-        
-        head_injection = import_map_tag + routing_fix
-        
         if re.search(r"<head\s*>", result, re.I):
-            result = re.sub(r"<head\s*>", lambda m: "<head>\n" + head_injection, result, count=1, flags=re.I)
+            result = re.sub(r"<head\s*>", lambda m: "<head>\n" + routing_fix, result, count=1, flags=re.I)
         elif re.search(r"<html\s*>", result, re.I):
-            result = re.sub(r"<html\s*>", lambda m: "<html>\n<head>\n" + head_injection + "</head>", result, count=1, flags=re.I)
+            result = re.sub(r"<html\s*>", lambda m: "<html>\n<head>\n" + routing_fix + "</head>", result, count=1, flags=re.I)
         else:
-            result = head_injection + result
+            result = routing_fix + result
 
         marker = '<script>window.MATRIX_KEY = "MATRIX";</script>'
         if re.search(r"</head\s*>", result, re.I):
             result = re.sub(r"</head\s*>", lambda m: marker + "\n</head>", result, count=1, flags=re.I)
         else:
             result = marker + result
+            
+        if re.search(r"<script[^>]+src=[\"'](?:/|\\./)?assets/[^\"']+\\.m?js", result, re.I):
+            raise ValueError("Local JavaScript asset abhi bhi external reh gaya; ZIP ka folder structure check karein.")
+        if re.search(r"<link[^>]+href=[\"'](?:/|\\./)?assets/[^\"']+\\.css", result, re.I):
+            raise ValueError("Local CSS asset abhi bhi external reh gaya; ZIP ka folder structure check karein.")
             
         Path(output_path).write_text(result, encoding="utf-8")
 
@@ -629,6 +564,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Invalid ya non-public website URL.")
         return
 
+    name, username = user_label(user)
     await message.reply_text(f"📈 {BRAND}\n\n⏳ Website process ho rahi hai...\nPlease wait. ZIP ready hone par yahin milegi.")
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
 
