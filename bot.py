@@ -27,12 +27,14 @@ from telegram.error import TimedOut, NetworkError, RetryAfter, BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 
 BRAND = "𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈"
-OWNER_ID = 8959111543
-BOT_TOKEN = "9226525353:AAGtDcXvmC7N8yo1wtmuCS5cvZ_6baJxNUU"
 
-# --- UPDATED CHANNEL DETAILS ---
-CHANNEL_ID = -1003636772569
-CHANNEL_LINK = "https://t.me/MATRIX_TRADER777"
+# --- LOADING ENVIRONMENT VARIABLES FROM RENDER ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "8959111543"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003636772569"))
+CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/MATRIX_TRADER777").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+# ------------------------------------------------
 
 MAX_FILES = 100
 MAX_FILE_BYTES = 3 * 1024 * 1024
@@ -242,15 +244,12 @@ def join_keyboard():
     ])
 
 async def is_member(bot, user_id):
-    """Check if user is a member, with proper error handling for Bot Admin issues."""
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
         return member.status in ("creator", "administrator", "member")
     except BadRequest as e:
-        # Agar user channel mein nahi hai
         if "user not found" in str(e).lower() or "participant" in str(e).lower():
             return False
-        # Agar bot admin nahi hai ya koi aur issue hai
         print(f"BadRequest in membership: {e}")
         return None
     except Exception as exc:
@@ -267,21 +266,18 @@ async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if status is True:
         return True
     elif status is None:
-        # Error state (Bot is not admin)
         error_text = (
             "⚠️ <b>Verification Error!</b>\n\n"
             "Bot aapka channel membership check nahi kar pa raha. Iska matlab hai ki Bot channel mein "
-            "<b>Admin</b> nahi hai.\n\n"
-            "Owner se kahein ki wo Bot ko channel mein Admin banayein."
+            "<b>Admin</b> nahi hai.\n\nOwner se kahein ki wo Bot ko channel mein Admin banayein."
         )
         if update.callback_query:
-            await update.callback_query.answer("Error: Bot needs Admin rights in channel.", show_alert=True)
+            await update.callback_query.answer("Error: Bot needs Admin rights.", show_alert=True)
             await update.callback_query.message.reply_text(error_text, parse_mode="HTML")
         elif update.effective_message:
             await update.effective_message.reply_text(error_text, parse_mode="HTML")
         return False
 
-    # User has not joined
     text = (
         f"🔒 <b>CHANNEL MEMBERSHIP REQUIRED</b>\n\n"
         f"Bot use karne se pehle hamara channel join karein.\n"
@@ -388,7 +384,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print("Owner notification failed:", owner_error)
 
         except Exception as exc:
-            await message.reply_text(f"❌ ZIP nahi ban paya.\nReason: {str(exc)[:250]}\n\nWebsite public honi chahiye.")
+            await message.reply_text(f"❌ ZIP nahi ban paya.\nReason: {str(exc)[:250]}")
 
 
 async def post_init(application: Application):
@@ -525,7 +521,7 @@ def convert_project_zip(zip_path, output_path):
         extract_project_zip(zip_path, root)
         all_html = list(root.rglob("*.html")) + list(root.rglob("*.htm"))
         if not all_html:
-            raise ValueError("ZIP mein koi HTML page nahi mila. Vite/React project ko pehle 'npm run build' karke 'dist' folder ki zip banayein.")
+            raise ValueError("ZIP mein koi HTML page nahi mila.")
         
         def entry_rank(p):
             n = p.name.lower()
@@ -690,7 +686,7 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN missing.")
+        raise SystemExit("BOT_TOKEN missing in Environment Variables.")
 
     bot_request = HTTPXRequest(connection_pool_size=20, connect_timeout=30, read_timeout=120, write_timeout=120, media_write_timeout=240, pool_timeout=30)
     polling_request = HTTPXRequest(connection_pool_size=4, connect_timeout=30, read_timeout=60, write_timeout=30, pool_timeout=30)
@@ -710,9 +706,24 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_error_handler(global_error_handler)
 
-    print(f"Starting combined {BRAND} bot...")
-    # Polling mode (Max2.py jaisa)
-    app.run_polling(drop_pending_updates=False, poll_interval=1, timeout=30)
+    print(f"Starting combined {BRAND} bot with Webhook mode...")
+    
+    webhook_path = "matrix-telegram"
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    port = int(os.getenv("PORT", "10000"))
+
+    if not render_url:
+        raise SystemExit("RENDER_EXTERNAL_URL missing. Are you running on Render?")
+    
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=webhook_path,
+        webhook_url=f"{render_url}/{webhook_path}",
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=False,
+        bootstrap_retries=-1,
+    )
 
 if __name__ == "__main__":
     try:
@@ -720,4 +731,3 @@ if __name__ == "__main__":
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
     main()
-    
