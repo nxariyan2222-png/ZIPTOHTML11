@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# 𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈 — Telegram Website-to-ZIP & ZIP-to-HTML Bot
-# Merged from max2.py + Fixed 404 Router & Vite Chunks
+# 𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈 — Ultimate Website-to-ZIP & ZIP-to-HTML Bot
+# Features: Vite Chunks Support, React Router Fix, Full Asset Inlining.
 
 import asyncio
 import ipaddress
@@ -24,12 +24,12 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.request import HTTPXRequest
-from telegram.error import TimedOut, NetworkError, RetryAfter, BadRequest
+from telegram.error import TimedOut, NetworkError, BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 
 BRAND = "𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈"
 
-# --- ENVIRONMENT VARIABLES (Render se load honge) ---
+# --- ENVIRONMENT VARIABLES ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "8959111543"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003636772569"))
@@ -50,7 +50,7 @@ last_request = {}
 MAX_UPLOAD_ZIP = 19 * 1024 * 1024
 MAX_UNPACKED_BYTES = 150 * 1024 * 1024
 
-# ================= WEBSITE TO ZIP LOGIC =================
+# ================= WEBSITE TO ZIP LOGIC (Unchanged) =================
 class LinkParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -210,7 +210,7 @@ def build_zip(start_url, zip_base, work_dir):
     return zip_path, len(saved)
 
 
-# ================= ZIP TO HTML LOGIC =================
+# ================= ULTIMATE ZIP TO HTML LOGIC =================
 def extract_project_zip(zip_path, root):
     total = 0
     with zipfile.ZipFile(zip_path) as zf:
@@ -273,7 +273,7 @@ class SingleHTMLInliner(HTMLParser):
         values = dict(attrs)
         tag_lower = tag.lower()
         
-        # Remove Vite modulepreload to stop missing asset errors
+        # Ignore Vite modulepreload to stop missing asset errors
         if tag_lower == "link" and values.get("rel") == "modulepreload":
             return
 
@@ -285,9 +285,11 @@ class SingleHTMLInliner(HTMLParser):
                 return
             if asset and "icon" in values.get("rel", "").lower():
                 values["href"] = asset_data_uri(asset)
+                
         if tag_lower == "script" and values.get("src"):
             asset = local_asset(self.entry.parent, values["src"], self.root)
             if asset and asset.suffix.lower() in (".js", ".mjs"):
+                # Preserve attributes like type="module"
                 attrs_text = "".join(
                     ' %s="%s"' % (k, v)
                     for k, v in attrs
@@ -298,11 +300,13 @@ class SingleHTMLInliner(HTMLParser):
                 js_text = re.sub(r"</script", r"<\\/script", js_text, flags=re.I)
                 self.output.append("<script%s>\n%s\n</script>" % (attrs_text, js_text))
                 return
+                
         for attr in ("src", "poster"):
             if values.get(attr):
                 asset = local_asset(self.entry.parent, values[attr], self.root)
                 if asset:
                     values[attr] = asset_data_uri(asset)
+                    
         if values.get("srcset"):
             candidates = []
             for part in values["srcset"].split(","):
@@ -313,6 +317,7 @@ class SingleHTMLInliner(HTMLParser):
                         bits[0] = asset_data_uri(asset)
                     candidates.append(" ".join(bits))
             values["srcset"] = ", ".join(candidates)
+            
         attrs_text = "".join(
             (' %s="%s"' % (k, (v or "").replace("&", "&amp;").replace('"', "&quot;")))
             if v is not None else " " + k for k, v in values.items()
@@ -334,89 +339,145 @@ def convert_project_zip(zip_path, output_path):
         root.mkdir()
         extract_project_zip(zip_path, root)
         
-        # 1. Build ImportMap for Vite dynamic chunks
+        # 1. Build Asset Map for Vite chunks & dynamic assets
+        asset_map = {}
         import_map = {}
-        for js_file in root.rglob("*.js"):
-            rel_path = js_file.relative_to(root).as_posix()
-            b64 = base64.b64encode(js_file.read_bytes()).decode("ascii")
-            uri = f"data:text/javascript;base64,{b64}"
-            import_map[rel_path] = uri          
-            import_map["/" + rel_path] = uri    
-            import_map["./" + rel_path] = uri   
-            import_map[js_file.name] = uri      
-            import_map["./" + js_file.name] = uri
+        for file_path in root.rglob("*"):
+            if not file_path.is_file(): continue
+            rel_path = file_path.relative_to(root).as_posix()
+            if rel_path.endswith((".html", ".htm")): continue
             
-        import_map_tag = ""
-        if import_map:
-            import_map_tag = f'<script type="importmap">\n{json.dumps({"imports": import_map})}\n</script>\n'
+            b64 = base64.b64encode(file_path.read_bytes()).decode("ascii")
+            mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+            data_uri = f"data:{mime};base64,{b64}"
+            
+            # Map all possible path variations
+            for p in [rel_path, "/" + rel_path, "./" + rel_path, file_path.name, "./" + file_path.name]:
+                asset_map[p] = data_uri
+                
+            # Register JS in ImportMap for dynamic Vite imports
+            if rel_path.endswith((".js", ".mjs")):
+                js_uri = f"data:text/javascript;base64,{b64}"
+                for p in [rel_path, "/" + rel_path, "./" + rel_path, file_path.name, "./" + file_path.name]:
+                    import_map[p] = js_uri
+                    
+        import_map_tag = f'<script type="importmap">\n{json.dumps({"imports": import_map})}\n</script>\n' if import_map else ""
 
         all_html = list(root.rglob("*.html")) + list(root.rglob("*.htm"))
         if not all_html:
             raise ValueError("ZIP mein koi HTML page nahi mila.")
-        
+            
         def entry_rank(p):
             n = p.name.lower()
             priority = 0 if n == "index.html" else 1 if n == "index.htm" else 2 if n == "main.html" else 3
             return (priority, len(p.relative_to(root).parts), str(p).lower())
-        
+            
         all_html.sort(key=entry_rank)
         entry = all_html[0]
         site_root = entry.parent.resolve()
+        
         parser = SingleHTMLInliner(entry.read_text("utf-8", errors="replace"), entry, site_root)
         result = "".join(parser.output)
         
-        # 2. 404 Fix (Router Hijack)
-        routing_fix = """
+        # 2. Ultimate Router & Fetch Hijack (Works in Chrome & Telegram)
+        routing_fix = f"""
         <script>
-        (function() {
+        window.__ASSET_MAP__ = {json.dumps(asset_map)};
+        (function() {{
+            // Override fetch to serve local assets
+            var origFetch = window.fetch;
+            window.fetch = function(input, init) {{
+                var url = typeof input === 'string' ? input : input.url;
+                if (window.__ASSET_MAP__ && window.__ASSET_MAP__[url]) {{
+                    return origFetch(window.__ASSET_MAP__[url], init);
+                }}
+                return origFetch.apply(this, arguments);
+            }};
+            
+            // Override XHR
+            var origXHR = window.XMLHttpRequest.prototype.open;
+            window.XMLHttpRequest.prototype.open = function(method, url, async, user, password) {{
+                if (window.__ASSET_MAP__ && window.__ASSET_MAP__[url]) {{
+                    arguments[1] = window.__ASSET_MAP__[url];
+                }}
+                return origXHR.apply(this, arguments);
+            }};
+
+            // Override Image Src
+            try {{
+                var origImgSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
+                if (origImgSrc && origImgSrc.set) {{
+                    Object.defineProperty(HTMLImageElement.prototype, "src", {{
+                        set: function(val) {{
+                            if (window.__ASSET_MAP__ && window.__ASSET_MAP__[val]) {{
+                                origImgSrc.set.call(this, window.__ASSET_MAP__[val]);
+                            }} else {{
+                                origImgSrc.set.call(this, val);
+                            }}
+                        }},
+                        get: origImgSrc.get
+                    }});
+                }}
+            }} catch(e) {{}}
+
+            // SPA Router Hijack
             var isLocal = window.location.protocol === 'file:' || window.location.protocol === 'content:';
-            if (isLocal) {
-                if (!window.location.hash) {
-                    try { window.location.hash = '#/'; } catch(e) {}
-                }
-                
-                // Aggressive Pathname override
-                try {
+            if (isLocal) {{
+                if (!window.location.hash) {{
+                    try {{ window.location.hash = '#/'; }} catch(e) {{}}
+                }}
+                try {{
                     var loc = window.location;
                     var proto = Object.getPrototypeOf(loc);
-                    try { Object.defineProperty(loc, 'pathname', { get: function() { return '/'; } }); } catch(e1) {}
-                    try { Object.defineProperty(proto, 'pathname', { get: function() { return '/'; } }); } catch(e2) {}
-                } catch(e) {}
+                    var pathnameDesc = Object.getOwnPropertyDescriptor(proto, 'pathname');
+                    if (pathnameDesc && pathnameDesc.get) {{
+                        Object.defineProperty(proto, 'pathname', {{
+                            configurable: true,
+                            get: function() {{
+                                var hash = window.location.hash;
+                                if (hash && hash.startsWith('#')) {{
+                                    var path = hash.substring(1);
+                                    return path.startsWith('/') ? path : '/' + path;
+                                }}
+                                return '/';
+                            }}
+                        }});
+                    }}
+                }} catch (e) {{}}
 
-                // History API Hijack
                 var origPush = history.pushState;
                 var origReplace = history.replaceState;
-                history.pushState = function(state, title, url) {
-                    if (url && url.startsWith('/') && !url.startsWith('//')) {
+                history.pushState = function(state, title, url) {{
+                    if (url && url.startsWith('/') && !url.startsWith('//')) {{
                         window.location.hash = url;
-                        window.dispatchEvent(new PopStateEvent('popstate', { state: state }));
-                    } else {
+                        window.dispatchEvent(new PopStateEvent('popstate', {{ state: state }}));
+                    }} else {{
                         origPush.apply(history, arguments);
-                    }
-                };
-                history.replaceState = function(state, title, url) {
-                    if (url && url.startsWith('/') && !url.startsWith('//')) {
+                    }}
+                }};
+                history.replaceState = function(state, title, url) {{
+                    if (url && url.startsWith('/') && !url.startsWith('//')) {{
                         var newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname + window.location.search + '#' + url;
-                        try { origReplace.call(history, state, title, newUrl); } catch(e) {}
-                    } else {
+                        try {{ origReplace.call(history, state, title, newUrl); }} catch(e) {{}}
+                    }} else {{
                         origReplace.apply(history, arguments);
-                    }
-                };
-                window.addEventListener('hashchange', function() {
-                    window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
-                });
-                document.addEventListener('click', function(e) {
+                    }}
+                }};
+                window.addEventListener('hashchange', function() {{
+                    window.dispatchEvent(new PopStateEvent('popstate', {{ state: null }}));
+                }});
+                document.addEventListener('click', function(e) {{
                     var a = e.target.closest('a');
-                    if (a) {
+                    if (a) {{
                         var href = a.getAttribute('href');
-                        if (href && href.startsWith('/') && !href.startsWith('//')) {
+                        if (href && href.startsWith('/') && !href.startsWith('//')) {{
                             e.preventDefault();
                             window.location.hash = href;
-                        }
-                    }
-                }, true);
-            }
-        })();
+                        }}
+                    }}
+                }}, true);
+            }}
+        }})();
         </script>
         <base href="./">
         """
@@ -565,7 +626,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Invalid ya non-public website URL.")
         return
 
-    name, username = user_label(user)
     await message.reply_text(f"📈 {BRAND}\n\n⏳ Website process ho rahi hai...\nPlease wait. ZIP ready hone par yahin milegi.")
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
 
@@ -576,13 +636,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption = f"📈 {BRAND}\n✅ WEBSITE ZIP READY\n🌐 {start_url}\n📁 Files: {count}\n━━━━━━━━━━━━━━━━━━"
             with zip_path.open("rb") as f:
                 await context.bot.send_document(chat_id=message.chat_id, document=f, filename=f"{zip_base}_MATRIX_MODS.zip", caption=caption)
-
-            try:
-                await context.bot.send_message(chat_id=OWNER_ID, text=f"New ZIP Request from {user.id} | {start_url}")
-                with zip_path.open("rb") as f:
-                    await context.bot.send_document(chat_id=OWNER_ID, document=f, filename=f"{zip_base}_MATRIX_MODS.zip")
-            except Exception:
-                pass
         except Exception as exc:
             await message.reply_text(f"❌ ZIP nahi ban paya.\nReason: {str(exc)[:250]}")
 
@@ -615,13 +668,6 @@ async def handle_uploaded_zip(update: Update, context: ContextTypes.DEFAULT_TYPE
                 filename="MATRIX_SINGLE.html",
                 caption="✅ Single HTML ready. 404 error fix ho gaya hai."
             )
-            
-            if user and user.id != OWNER_ID:
-                try:
-                    with html_path.open("rb") as f:
-                        await context.bot.send_document(chat_id=OWNER_ID, document=f, filename="MATRIX_SINGLE.html", caption=f"HTML for user {user.id}")
-                except Exception:
-                    pass
             await status.delete()
         except Exception as exc:
             await status.edit_text("❌ HTML conversion failed: " + str(exc)[:500])
