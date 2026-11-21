@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # 𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈 — Telegram Website-to-ZIP & ZIP-to-HTML Bot
+# Fully Optimized for Render + Vite/React SPA Fixes
 
 import asyncio
 import ipaddress
+import json
 import os
 import re
 import shutil
@@ -26,12 +28,14 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 BRAND = "𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈"
 
-# --- LOADING ENVIRONMENT VARIABLES FROM RENDER ---
+# --- ENVIRONMENT VARIABLES (Render se load honge) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "8959111543"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003636772569"))
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/MATRIX_TRADER777").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+PORT = int(os.getenv("PORT", "10000"))
 
 MAX_FILES = 100
 MAX_FILE_BYTES = 3 * 1024 * 1024
@@ -191,13 +195,11 @@ def build_zip(start_url, zip_base, work_dir):
         time.sleep(0.03)
 
     if not saved:
-        raise RuntimeError("No public files could be downloaded. The site may block requests.")
+        raise RuntimeError("No public files could be downloaded.")
 
     readme = work / "MATRIX_MODS_INFO.txt"
-    readme.write_text(
-        f"{BRAND}\nWEBSITE TO ZIP BACKUP\n\nSource: {start_url}\nFiles: {len(saved)}\n",
-        encoding="utf-8"
-    )
+    readme.write_text(f"{BRAND}\nWEBSITE TO ZIP BACKUP\n\nSource: {start_url}\nFiles: {len(saved)}\n", encoding="utf-8")
+    
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for file in work.rglob("*"):
             if file.is_file():
@@ -270,7 +272,7 @@ class SingleHTMLInliner(HTMLParser):
         values = dict(attrs)
         tag_lower = tag.lower()
         
-        # 404 FIX: Remove Vite modulepreload tags to prevent missing chunk errors
+        # Remove Vite modulepreload to stop missing asset errors
         if tag_lower == "link" and values.get("rel") == "modulepreload":
             return
 
@@ -334,6 +336,24 @@ def convert_project_zip(zip_path, output_path):
         root = Path(td) / "project"
         root.mkdir()
         extract_project_zip(zip_path, root)
+        
+        # BUILD IMPORT MAP to fix Vite Dynamic Chunks (Error: Failed to fetch dynamically imported module)
+        import_map = {}
+        for js_file in root.rglob("*.js"):
+            rel_path = js_file.relative_to(root).as_posix()
+            b64 = base64.b64encode(js_file.read_bytes()).decode("ascii")
+            uri = f"data:text/javascript;base64,{b64}"
+            
+            import_map[rel_path] = uri          
+            import_map["/" + rel_path] = uri    
+            import_map["./" + rel_path] = uri   
+            import_map[js_file.name] = uri      
+            import_map["./" + js_file.name] = uri
+            
+        import_map_tag = ""
+        if import_map:
+            import_map_tag = f'<script type="importmap">\n{json.dumps({"imports": import_map})}\n</script>\n'
+
         all_html = list(root.rglob("*.html")) + list(root.rglob("*.htm"))
         if not all_html:
             raise ValueError("ZIP mein koi HTML page nahi mila.")
@@ -349,25 +369,23 @@ def convert_project_zip(zip_path, output_path):
         parser = SingleHTMLInliner(entry.read_text("utf-8", errors="replace"), entry, site_root)
         result = "".join(parser.output)
         
-        # --- SUPER-STRONG HASH ROUTER PATCH (Fixes React/Vue 404 on local files) ---
+        # SUPER-STRONG HASH ROUTER PATCH
         routing_fix = """
         <script>
         (function() {
             var isLocal = window.location.protocol === 'file:' || window.location.protocol === 'content:';
             if (isLocal) {
-                // 1. Ensure we have a hash, default to '#/'
                 if (!window.location.hash) {
-                    window.history.replaceState(null, '', '#/');
+                    try { window.location.hash = '#/'; } catch(e) {}
                 }
 
-                // 2. Override Location prototype getters to trick React Router
                 try {
                     var loc = window.location;
                     var proto = Object.getPrototypeOf(loc);
-                    var pathnameDesc = Object.getOwnPropertyDescriptor(proto, 'pathname');
                     
+                    var pathnameDesc = Object.getOwnPropertyDescriptor(proto, 'pathname');
                     if (pathnameDesc && pathnameDesc.get) {
-                        Object.defineProperty(loc, 'pathname', {
+                        Object.defineProperty(proto, 'pathname', {
                             configurable: true,
                             get: function() {
                                 var hash = window.location.hash;
@@ -381,13 +399,13 @@ def convert_project_zip(zip_path, output_path):
                     }
                 } catch (e) { console.log("Location override failed", e); }
 
-                // 3. Hijack history API to use hash
                 var origPush = history.pushState;
                 var origReplace = history.replaceState;
 
                 history.pushState = function(state, title, url) {
                     if (url && url.startsWith('/') && !url.startsWith('//')) {
                         window.location.hash = url;
+                        window.dispatchEvent(new PopStateEvent('popstate', { state: state }));
                     } else {
                         origPush.apply(history, arguments);
                     }
@@ -396,19 +414,16 @@ def convert_project_zip(zip_path, output_path):
                 history.replaceState = function(state, title, url) {
                     if (url && url.startsWith('/') && !url.startsWith('//')) {
                         var newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname + window.location.search + '#' + url;
-                        origReplace.call(history, state, title, newUrl);
+                        try { origReplace.call(history, state, title, newUrl); } catch(e) {}
                     } else {
                         origReplace.apply(history, arguments);
                     }
                 };
 
-                // 4. Listen to hash changes and dispatch popstate
                 window.addEventListener('hashchange', function() {
-                    var event = new PopStateEvent('popstate', { state: null });
-                    window.dispatchEvent(event);
+                    window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
                 });
                 
-                // 5. Intercept clicks
                 document.addEventListener('click', function(e) {
                     var a = e.target.closest('a');
                     if (a) {
@@ -425,12 +440,14 @@ def convert_project_zip(zip_path, output_path):
         <base href="./">
         """
         
+        head_injection = import_map_tag + routing_fix
+        
         if re.search(r"<head\s*>", result, re.I):
-            result = re.sub(r"<head\s*>", lambda m: "<head>\n" + routing_fix, result, count=1, flags=re.I)
+            result = re.sub(r"<head\s*>", lambda m: "<head>\n" + head_injection, result, count=1, flags=re.I)
         elif re.search(r"<html\s*>", result, re.I):
-            result = re.sub(r"<html\s*>", lambda m: "<html>\n<head>\n" + routing_fix + "</head>", result, count=1, flags=re.I)
+            result = re.sub(r"<html\s*>", lambda m: "<html>\n<head>\n" + head_injection + "</head>", result, count=1, flags=re.I)
         else:
-            result = routing_fix + result
+            result = head_injection + result
 
         marker = '<script>window.MATRIX_KEY = "MATRIX";</script>'
         if re.search(r"</head\s*>", result, re.I):
@@ -530,12 +547,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "help":
         await query.answer()
-        await query.message.reply_text(
-            "📚 <b>HOW TO USE</b>\n\n"
-            "🌐 Website ZIP: public website ka URL bhejein.\n"
-            "📦 ZIP to HTML: .zip document upload karein.",
-            reply_markup=main_keyboard(), parse_mode="HTML"
-        )
+        await query.message.reply_text("📚 <b>HOW TO USE</b>\n\n🌐 Website ZIP: URL bhejein.\n📦 ZIP to HTML: .zip document upload karein.", reply_markup=main_keyboard(), parse_mode="HTML")
     elif data == "feature_zip":
         await query.answer()
         await query.message.reply_text("🌐 <b>WEBSITE → ZIP</b>\nPublic website ka https:// URL yahan send karein.", reply_markup=main_keyboard(), parse_mode="HTML")
@@ -569,7 +581,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw = "https://" + raw
     start_url = safe_public_url(raw)
     if not start_url:
-        await message.reply_text("❌ Invalid ya non-public website URL. Public http/https URL bhejein.")
+        await message.reply_text("❌ Invalid ya non-public website URL.")
         return
 
     await message.reply_text(f"📈 {BRAND}\n\n⏳ Website process ho rahi hai...\nPlease wait. ZIP ready hone par yahin milegi.")
@@ -589,7 +601,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_document(chat_id=OWNER_ID, document=f, filename=f"{zip_base}_MATRIX_MODS.zip")
             except Exception:
                 pass
-
         except Exception as exc:
             await message.reply_text(f"❌ ZIP nahi ban paya.\nReason: {str(exc)[:250]}")
 
@@ -684,7 +695,7 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN missing in Environment Variables.")
 
-    # Render par bade files bhejne ke liye extended timeouts
+    # Large file uploads ke liye extended timeouts
     bot_request = HTTPXRequest(connection_pool_size=20, connect_timeout=30, read_timeout=120, write_timeout=120, media_write_timeout=240, pool_timeout=30)
     polling_request = HTTPXRequest(connection_pool_size=4, connect_timeout=30, read_timeout=60, write_timeout=30, pool_timeout=30)
 
@@ -696,6 +707,7 @@ def main():
         .post_init(post_init)
         .build()
     )
+    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(button_router))
@@ -703,24 +715,26 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_error_handler(global_error_handler)
 
-    print(f"Starting combined {BRAND} bot with Webhook mode...")
+    # 🚀 AUTOMATIC WEBHOOK / POLLING SETUP
+    # Agar Render par hai (RENDER_EXTERNAL_URL mila hai), toh Webhook use hoga.
+    # Agar local system par hai, toh Polling use hoga.
     
-    webhook_path = "matrix-telegram"
-    render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-    port = int(os.getenv("PORT", "10000"))
-
-    if not render_url:
-        raise SystemExit("RENDER_EXTERNAL_URL missing. Are you running on Render?")
-    
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=webhook_path,
-        webhook_url=f"{render_url}/{webhook_path}",
-        secret_token=WEBHOOK_SECRET,
-        drop_pending_updates=False,
-        bootstrap_retries=-1,
-    )
+    if RENDER_EXTERNAL_URL:
+        print(f"Starting bot in WEBHOOK mode on {RENDER_EXTERNAL_URL}...")
+        webhook_path = "matrix-telegram"
+        
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=webhook_path,
+            webhook_url=f"{RENDER_EXTERNAL_URL}/{webhook_path}",
+            secret_token=WEBHOOK_SECRET,
+            drop_pending_updates=False,
+            bootstrap_retries=-1,
+        )
+    else:
+        print("Starting bot in POLLING mode (Local System)...")
+        app.run_polling(drop_pending_updates=False, poll_interval=1, timeout=30)
 
 if __name__ == "__main__":
     try:
