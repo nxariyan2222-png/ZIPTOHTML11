@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # 𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈 — Telegram Website-to-ZIP & ZIP-to-HTML Bot
-# Fully Optimized for Render + Vite/React SPA Fixes
+# Fully Optimized for Render + Vite/React SPA Fixes (ImportMap + AssetMap)
 
 import asyncio
 import ipaddress
@@ -28,7 +28,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 BRAND = "𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈"
 
-# --- ENVIRONMENT VARIABLES (Render se load honge) ---
+# --- ENVIRONMENT VARIABLES ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "8959111543"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003636772569"))
@@ -272,7 +272,6 @@ class SingleHTMLInliner(HTMLParser):
         values = dict(attrs)
         tag_lower = tag.lower()
         
-        # Remove Vite modulepreload to stop missing asset errors
         if tag_lower == "link" and values.get("rel") == "modulepreload":
             return
 
@@ -337,26 +336,9 @@ def convert_project_zip(zip_path, output_path):
         root.mkdir()
         extract_project_zip(zip_path, root)
         
-        # BUILD IMPORT MAP to fix Vite Dynamic Chunks (Error: Failed to fetch dynamically imported module)
-        import_map = {}
-        for js_file in root.rglob("*.js"):
-            rel_path = js_file.relative_to(root).as_posix()
-            b64 = base64.b64encode(js_file.read_bytes()).decode("ascii")
-            uri = f"data:text/javascript;base64,{b64}"
-            
-            import_map[rel_path] = uri          
-            import_map["/" + rel_path] = uri    
-            import_map["./" + rel_path] = uri   
-            import_map[js_file.name] = uri      
-            import_map["./" + js_file.name] = uri
-            
-        import_map_tag = ""
-        if import_map:
-            import_map_tag = f'<script type="importmap">\n{json.dumps({"imports": import_map})}\n</script>\n'
-
         all_html = list(root.rglob("*.html")) + list(root.rglob("*.htm"))
         if not all_html:
-            raise ValueError("ZIP mein koi HTML page nahi mila.")
+            raise ValueError("ZIP mein koi HTML page nahi mila. Vite/React project ko pehle 'npm run build' karke 'dist' folder ki zip banayein.")
         
         def entry_rank(p):
             n = p.name.lower()
@@ -366,79 +348,142 @@ def convert_project_zip(zip_path, output_path):
         all_html.sort(key=entry_rank)
         entry = all_html[0]
         site_root = entry.parent.resolve()
-        parser = SingleHTMLInliner(entry.read_text("utf-8", errors="replace"), entry, site_root)
-        result = "".join(parser.output)
         
-        # SUPER-STRONG HASH ROUTER PATCH
-        routing_fix = """
+        # 1. Build Asset Map for fetching images, json, fonts, etc dynamically
+        asset_map = {}
+        import_map = {}
+        
+        for file_path in root.rglob("*"):
+            if not file_path.is_file():
+                continue
+                
+            rel_path = file_path.relative_to(root).as_posix()
+            if rel_path.endswith(".html") or rel_path.endswith(".htm"):
+                continue
+                
+            b64 = base64.b64encode(file_path.read_bytes()).decode("ascii")
+            mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+            data_uri = f"data:{mime};base64,{b64}"
+            
+            paths = [rel_path, "/" + rel_path, "./" + rel_path, file_path.name, "./" + file_path.name]
+            
+            for p in paths:
+                asset_map[p] = data_uri
+                
+            # Register JS in ImportMap
+            if rel_path.endswith(".js") or rel_path.endswith(".mjs"):
+                js_data_uri = f"data:text/javascript;base64,{b64}"
+                for p in paths:
+                    import_map[p] = js_data_uri
+                    
+        import_map_tag = f'<script type="importmap">\n{json.dumps({"imports": import_map})}\n</script>\n' if import_map else ""
+        
+        # 2. Override fetch, XHR, Image to load local assets & Fix React Router
+        routing_fix = f"""
         <script>
-        (function() {
-            var isLocal = window.location.protocol === 'file:' || window.location.protocol === 'content:';
-            if (isLocal) {
-                if (!window.location.hash) {
-                    try { window.location.hash = '#/'; } catch(e) {}
-                }
+        window.__ASSET_MAP__ = {json.dumps(asset_map)};
+        
+        (function() {{
+            // Override Fetch
+            var origFetch = window.fetch;
+            window.fetch = function(input, init) {{
+                var url = typeof input === 'string' ? input : input.url;
+                if (window.__ASSET_MAP__ && window.__ASSET_MAP__[url]) {{
+                    return origFetch(window.__ASSET_MAP__[url], init);
+                }}
+                return origFetch.apply(this, arguments);
+            }};
+            
+            // Override XHR
+            var origXHR = window.XMLHttpRequest.prototype.open;
+            window.XMLHttpRequest.prototype.open = function(method, url, async, user, password) {{
+                if (window.__ASSET_MAP__ && window.__ASSET_MAP__[url]) {{
+                    arguments[1] = window.__ASSET_MAP__[url];
+                }}
+                return origXHR.apply(this, arguments);
+            }};
 
-                try {
+            // Override Image Src (for dynamically loaded images)
+            try {{
+                var origImgSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
+                if (origImgSrc && origImgSrc.set) {{
+                    Object.defineProperty(HTMLImageElement.prototype, "src", {{
+                        set: function(val) {{
+                            if (window.__ASSET_MAP__ && window.__ASSET_MAP__[val]) {{
+                                origImgSrc.set.call(this, window.__ASSET_MAP__[val]);
+                            }} else {{
+                                origImgSrc.set.call(this, val);
+                            }}
+                        }},
+                        get: origImgSrc.get
+                    }});
+                }}
+            }} catch(e) {{}}
+
+            // React Router Fix
+            var isLocal = window.location.protocol === 'file:' || window.location.protocol === 'content:';
+            if (isLocal) {{
+                if (!window.location.hash) {{
+                    try {{ window.location.hash = '#/'; }} catch(e) {{}}
+                }}
+                try {{
                     var loc = window.location;
                     var proto = Object.getPrototypeOf(loc);
-                    
                     var pathnameDesc = Object.getOwnPropertyDescriptor(proto, 'pathname');
-                    if (pathnameDesc && pathnameDesc.get) {
-                        Object.defineProperty(proto, 'pathname', {
+                    if (pathnameDesc && pathnameDesc.get) {{
+                        Object.defineProperty(proto, 'pathname', {{
                             configurable: true,
-                            get: function() {
+                            get: function() {{
                                 var hash = window.location.hash;
-                                if (hash && hash.startsWith('#')) {
+                                if (hash && hash.startsWith('#')) {{
                                     var path = hash.substring(1);
                                     return path.startsWith('/') ? path : '/' + path;
-                                }
+                                }}
                                 return '/';
-                            }
-                        });
-                    }
-                } catch (e) { console.log("Location override failed", e); }
+                            }}
+                        }});
+                    }}
+                }} catch (e) {{}}
 
                 var origPush = history.pushState;
                 var origReplace = history.replaceState;
-
-                history.pushState = function(state, title, url) {
-                    if (url && url.startsWith('/') && !url.startsWith('//')) {
+                history.pushState = function(state, title, url) {{
+                    if (url && url.startsWith('/') && !url.startsWith('//')) {{
                         window.location.hash = url;
-                        window.dispatchEvent(new PopStateEvent('popstate', { state: state }));
-                    } else {
+                        window.dispatchEvent(new PopStateEvent('popstate', {{ state: state }}));
+                    }} else {{
                         origPush.apply(history, arguments);
-                    }
-                };
-                
-                history.replaceState = function(state, title, url) {
-                    if (url && url.startsWith('/') && !url.startsWith('//')) {
+                    }}
+                }};
+                history.replaceState = function(state, title, url) {{
+                    if (url && url.startsWith('/') && !url.startsWith('//')) {{
                         var newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname + window.location.search + '#' + url;
-                        try { origReplace.call(history, state, title, newUrl); } catch(e) {}
-                    } else {
+                        try {{ origReplace.call(history, state, title, newUrl); }} catch(e) {{}}
+                    }} else {{
                         origReplace.apply(history, arguments);
-                    }
-                };
-
-                window.addEventListener('hashchange', function() {
-                    window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
-                });
-                
-                document.addEventListener('click', function(e) {
+                    }}
+                }};
+                window.addEventListener('hashchange', function() {{
+                    window.dispatchEvent(new PopStateEvent('popstate', {{ state: null }}));
+                }});
+                document.addEventListener('click', function(e) {{
                     var a = e.target.closest('a');
-                    if (a) {
+                    if (a) {{
                         var href = a.getAttribute('href');
-                        if (href && href.startsWith('/') && !href.startsWith('//')) {
+                        if (href && href.startsWith('/') && !href.startsWith('//')) {{
                             e.preventDefault();
                             window.location.hash = href;
-                        }
-                    }
-                }, true);
-            }
-        })();
+                        }}
+                    }}
+                }}, true);
+            }}
+        }})();
         </script>
         <base href="./">
         """
+        
+        parser = SingleHTMLInliner(entry.read_text("utf-8", errors="replace"), entry, site_root)
+        result = "".join(parser.output)
         
         head_injection = import_map_tag + routing_fix
         
@@ -695,7 +740,6 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN missing in Environment Variables.")
 
-    # Large file uploads ke liye extended timeouts
     bot_request = HTTPXRequest(connection_pool_size=20, connect_timeout=30, read_timeout=120, write_timeout=120, media_write_timeout=240, pool_timeout=30)
     polling_request = HTTPXRequest(connection_pool_size=4, connect_timeout=30, read_timeout=60, write_timeout=30, pool_timeout=30)
 
@@ -715,10 +759,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_error_handler(global_error_handler)
 
-    # 🚀 AUTOMATIC WEBHOOK / POLLING SETUP
-    # Agar Render par hai (RENDER_EXTERNAL_URL mila hai), toh Webhook use hoga.
-    # Agar local system par hai, toh Polling use hoga.
-    
     if RENDER_EXTERNAL_URL:
         print(f"Starting bot in WEBHOOK mode on {RENDER_EXTERNAL_URL}...")
         webhook_path = "matrix-telegram"
