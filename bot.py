@@ -29,8 +29,11 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 BRAND = "𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈"
 OWNER_ID = int(os.getenv("OWNER_ID", "8959111543"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1004473792888"))
-CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/+zrivpvZr3S1mODVl").strip()
+
+# --- UPDATED CHANNEL DETAILS ---
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003636772569"))
+CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/MATRIX_TRADER777").strip()
+# -------------------------------
 
 MAX_FILES = 100
 MAX_FILE_BYTES = 3 * 1024 * 1024
@@ -65,7 +68,6 @@ def clean_name(value):
 
 
 def safe_public_url(url):
-    """Reject non-http(s), credentials, localhost, and private/reserved IP targets."""
     url, _ = urldefrag(url.strip())
     p = urlparse(url)
     if p.scheme not in ("http", "https") or not p.hostname:
@@ -90,7 +92,6 @@ def safe_public_url(url):
 
 
 def fetch_public(url):
-    """Fetch with redirects checked manually to reduce SSRF risk."""
     session = requests.Session()
     current = url
     for _ in range(5):
@@ -223,7 +224,6 @@ def user_label(user):
     return name, username
 
 
-
 # ---------------- PREMIUM MENU + FORCE JOIN ----------------
 def main_keyboard():
     return InlineKeyboardMarkup([
@@ -245,16 +245,33 @@ async def is_member(bot, user_id):
         member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
         return member.status in ("creator", "administrator", "member")
     except Exception as exc:
-        # Verification errors should fail closed, not grant access.
         print(f"Channel membership check failed: {exc}")
-        return False
+        return None # Return None to indicate a bot error (like not being admin)
 
 async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return False
-    if await is_member(context.bot, user.id):
+    
+    status = await is_member(context.bot, user.id)
+    
+    if status is True:
         return True
+    elif status is None:
+        error_text = (
+            "⚠️ <b>Verification Error!</b>\n\n"
+            "Bot is unable to check your membership. This usually happens if the Bot is not "
+            "an <b>Admin</b> in the channel.\n\n"
+            "Please ask the Owner to make the bot Admin in the channel."
+        )
+        if update.callback_query:
+            await update.callback_query.answer("Bot needs Admin rights in channel.", show_alert=True)
+            await update.callback_query.message.reply_text(error_text, parse_mode="HTML")
+        elif update.effective_message:
+            await update.effective_message.reply_text(error_text, parse_mode="HTML")
+        return False
+
+    # If status is False (not joined)
     text = (
         f"🔒 <b>CHANNEL MEMBERSHIP REQUIRED</b>\n\n"
         f"Bot use karne se pehle hamara channel join karein.\n"
@@ -276,19 +293,27 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         return
     data = query.data or ""
+    
     if data == "verify_join":
-        if await is_member(context.bot, query.from_user.id):
+        status = await is_member(context.bot, query.from_user.id)
+        if status is True:
             await query.answer("Membership verified! Welcome.", show_alert=True)
             await query.message.reply_text(
                 f"✨ <b>ACCESS GRANTED</b>\n\nWelcome to {BRAND}!",
                 reply_markup=main_keyboard(), parse_mode="HTML"
             )
+        elif status is None:
+             await query.answer("Error: Bot needs Admin rights in channel.", show_alert=True)
         else:
             await query.answer("Abhi channel membership detect nahi hui. Join karke dobara try karein.", show_alert=True)
             await query.message.reply_text(
                 "🔒 Pehle channel join karein, phir verify dabayein.",
                 reply_markup=join_keyboard()
             )
+        return
+
+    # For all other buttons, check membership first
+    if not await require_membership(update, context):
         return
 
     if data == "help":
@@ -327,6 +352,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not user or not message or not message.text:
         return
+    
+    # Check membership on every task
     if not await require_membership(update, context):
         return
 
@@ -371,7 +398,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     filename=f"{zip_base}_MATRIX_MODS.zip", caption=caption
                 )
 
-            # Owner receives the original link, ZIP, and user details.
             owner_caption = (
                 f"📈 {BRAND} — NEW ZIP REQUEST\n"
                 "━━━━━━━━━━━━━━━━━━\n"
@@ -392,7 +418,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         caption=f"📈 {BRAND}\n🌐 Source: {start_url}\n🆔 User: {user.id}"
                     )
             except Exception as owner_error:
-                # User delivery is not undone if owner has not started the bot.
                 print("Owner notification failed:", owner_error)
 
         except Exception as exc:
@@ -413,7 +438,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application: Application):
     print(f"{BRAND} bot started successfully.")
-
 
 
 # ---------------- ZIP -> SINGLE HTML FEATURE ----------------
@@ -453,8 +477,6 @@ def local_asset(base_dir, value, root):
         return None
     value = value.split("#", 1)[0].split("?", 1)[0]
     decoded = unquote(value)
-    # In websites, /assets/app.css means project-root/assets/app.css,
-    # not the Android filesystem's actual /assets/app.css.
     if decoded.startswith("/"):
         decoded = decoded.lstrip("/")
         path = (root / decoded).resolve()
@@ -498,8 +520,6 @@ class SingleHTMLInliner(HTMLParser):
         if tag_lower == "script" and values.get("src"):
             asset = local_asset(self.entry.parent, values["src"], self.root)
             if asset and asset.suffix.lower() in (".js", ".mjs"):
-                # Inline both classic scripts and Vite/Rollup module bundles.
-                # Keep type="module" for module scripts so their semantics remain intact.
                 attrs_text = "".join(
                     ' %s="%s"' % (k, v)
                     for k, v in attrs
@@ -507,7 +527,6 @@ class SingleHTMLInliner(HTMLParser):
                     and v is not None
                 )
                 js_text = asset.read_text("utf-8", errors="replace")
-                # A literal closing script sequence would terminate the HTML script element.
                 js_text = re.sub(r"</script", r"<\\/script", js_text, flags=re.I)
                 self.output.append("<script%s>\n%s\n</script>" % (attrs_text, js_text))
                 return
@@ -552,35 +571,83 @@ def convert_project_zip(zip_path, output_path):
                 "ZIP mein koi HTML page nahi mila. React/Vite source-only project "
                 "(src/*.jsx, package.json) ko pehle build karke dist folder ZIP karein."
             )
-        # Prefer index.html, then index.htm, then main.html, then the shallowest HTML file.
         def entry_rank(p):
             n = p.name.lower()
             priority = 0 if n == "index.html" else 1 if n == "index.htm" else 2 if n == "main.html" else 3
             return (priority, len(p.relative_to(root).parts), str(p).lower())
         all_html.sort(key=entry_rank)
         entry = all_html[0]
-        # Website root is the directory containing the chosen entry HTML.
-        # This matters for ZIPs whose entire site is inside a top-level folder.
         site_root = entry.parent.resolve()
         parser = SingleHTMLInliner(entry.read_text("utf-8", errors="replace"), entry, site_root)
         result = "".join(parser.output)
-        # Marker only; it does not bypass or rewrite arbitrary authentication.
+        
+        # --- SMART ROUTING FIX FOR 404 ERROR IN SPA ---
+        routing_fix = """
+        <script>
+        (function() {
+            var isLocal = window.location.protocol === 'file:' || window.location.protocol === 'content:';
+            if (isLocal) {
+                // Force path to root if it's a SPA and the path is weird
+                if (window.location.pathname !== '/' && !window.location.pathname.endsWith('.html')) {
+                    try { history.replaceState(null, null, '/'); } catch(e) {}
+                }
+                // Override history methods to use hash routing for absolute paths
+                var pushState = history.pushState;
+                history.pushState = function(state, title, url) {
+                    if (url && url.startsWith('/')) { url = '#' + url; }
+                    return pushState.apply(history, [state, title, url]);
+                };
+                var replaceState = history.replaceState;
+                history.replaceState = function(state, title, url) {
+                    if (url && url.startsWith('/')) { url = '#' + url; }
+                    return replaceState.apply(history, [state, title, url]);
+                };
+                // Intercept clicks on anchor tags with absolute paths
+                document.addEventListener('click', function(e) {
+                    var a = e.target.closest('a');
+                    if (a) {
+                        var href = a.getAttribute('href');
+                        if (href && href.startsWith('/') && !href.startsWith('//')) {
+                            a.setAttribute('href', '#' + href);
+                        }
+                    }
+                });
+            }
+        })();
+        </script>
+        <base href="./">
+        """
+        
+        # Inject routing fix at the very beginning of <head> or <html>
+        if re.search(r"<head\s*>", result, re.I):
+            result = re.sub(r"<head\s*>", r"<head>" + routing_fix, result, count=1, flags=re.I)
+        elif re.search(r"<html\s*>", result, re.I):
+            result = re.sub(r"<html\s*>", r"<html><head>" + routing_fix + "</head>", result, count=1, flags=re.I)
+        else:
+            result = routing_fix + result
+
         marker = '<script>window.MATRIX_KEY = "MATRIX";</script>'
         if re.search(r"</head\s*>", result, re.I):
             result = re.sub(r"</head\s*>", marker + "</head>", result, count=1, flags=re.I)
         else:
             result = marker + result
-        # Refuse to send a broken "single HTML" when local app bundles were not embedded.
+            
         if re.search(r"<script[^>]+src=[\"'](?:/|\\./)?assets/[^\"']+\\.m?js", result, re.I):
             raise ValueError("Local JavaScript asset abhi bhi external reh gaya; ZIP ka folder structure check karein.")
         if re.search(r"<link[^>]+href=[\"'](?:/|\\./)?assets/[^\"']+\\.css", result, re.I):
             raise ValueError("Local CSS asset abhi bhi external reh gaya; ZIP ka folder structure check karein.")
+        
         Path(output_path).write_text(result, encoding="utf-8")
 
 async def handle_uploaded_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user, message, doc = update.effective_user, update.message, update.message.document
-    if not user or not await require_membership(update, context):
+    if not user:
         return
+        
+    # Check membership on every task
+    if not await require_membership(update, context):
+        return
+        
     if not doc or not (doc.file_name or "").lower().endswith(".zip"):
         await message.reply_text("❌ ZIP document bhejiye (.zip).")
         return
@@ -602,9 +669,8 @@ async def handle_uploaded_zip(update: Update, context: ContextTypes.DEFAULT_TYPE
             await message.reply_document(
                 document=html_path.open("rb"),
                 filename="MATRIX_SINGLE.html",
-                caption="✅ Single HTML ready. Backend/API dependent features alag se required ho sakte hain."
+                caption="✅ Single HTML ready. Ab isme 404 error nahi aayega."
             )
-            # Owner receives both input ZIP and output HTML.
             if user and user.id != OWNER_ID:
                 try:
                     await context.bot.send_message(
@@ -618,8 +684,7 @@ async def handle_uploaded_zip(update: Update, context: ContextTypes.DEFAULT_TYPE
                         await context.bot.send_document(chat_id=OWNER_ID, document=f,
                             filename="MATRIX_SINGLE.html", caption=f"Generated HTML for user {user.id}")
                 except Exception as owner_exc:
-                    log_owner_error = str(owner_exc)
-                    print("Owner delivery failed:", log_owner_error)
+                    print("Owner delivery failed:", str(owner_exc))
             await status.delete()
         except Exception as exc:
             await status.edit_text("❌ HTML conversion failed: " + str(exc)[:500])
@@ -629,13 +694,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     user = update.effective_user
-    if user and not await is_member(context.bot, user.id):
+    
+    status = await is_member(context.bot, user.id) if user else False
+    if status is not True:
         await update.message.reply_text(
             f"✨ <b>WELCOME TO {BRAND}</b>\n\n"
             "Premium website utility bot. Features unlock karne ke liye pehle channel join karein.",
             reply_markup=join_keyboard(), parse_mode="HTML"
         )
         return
+        
     await update.message.reply_text(
         f"╔════════════════════╗\n"
         f"   ✦ <b>{BRAND}</b> ✦\n"
@@ -666,7 +734,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Log Telegram/network errors instead of letting an update crash silently."""
     error = context.error
     if isinstance(error, TimedOut):
         print("Telegram request timed out. Check internet; the bot will continue polling.")
@@ -680,7 +747,6 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN missing. Add it as a Render environment variable.")
 
-    # Larger timeouts are important when sending ZIP/HTML files over mobile data.
     bot_request = HTTPXRequest(
         connection_pool_size=20,
         connect_timeout=30,
@@ -737,3 +803,4 @@ if __name__ == "__main__":
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
     main()
+    
