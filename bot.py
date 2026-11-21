@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # 𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈 — Telegram Website-to-ZIP & ZIP-to-HTML Bot
+# Merged from max2.py + Fixed 404 Router & Vite Chunks
 
 import asyncio
 import ipaddress
@@ -208,13 +209,8 @@ def build_zip(start_url, zip_base, work_dir):
         raise RuntimeError("ZIP is too large for Telegram (45 MB limit).")
     return zip_path, len(saved)
 
-def user_label(user):
-    name = " ".join(x for x in [user.first_name, user.last_name] if x) or "Not set"
-    username = f"@{user.username}" if user.username else "Not set"
-    return name, username
 
-
-# ================= ZIP TO HTML LOGIC (From Max2.py) =================
+# ================= ZIP TO HTML LOGIC =================
 def extract_project_zip(zip_path, root):
     total = 0
     with zipfile.ZipFile(zip_path) as zf:
@@ -277,7 +273,7 @@ class SingleHTMLInliner(HTMLParser):
         values = dict(attrs)
         tag_lower = tag.lower()
         
-        # 404 Fix: Ignore Vite modulepreload to prevent failed chunk loading
+        # Remove Vite modulepreload to stop missing asset errors
         if tag_lower == "link" and values.get("rel") == "modulepreload":
             return
 
@@ -337,9 +333,26 @@ def convert_project_zip(zip_path, output_path):
         root = Path(td) / "project"
         root.mkdir()
         extract_project_zip(zip_path, root)
+        
+        # 1. Build ImportMap for Vite dynamic chunks
+        import_map = {}
+        for js_file in root.rglob("*.js"):
+            rel_path = js_file.relative_to(root).as_posix()
+            b64 = base64.b64encode(js_file.read_bytes()).decode("ascii")
+            uri = f"data:text/javascript;base64,{b64}"
+            import_map[rel_path] = uri          
+            import_map["/" + rel_path] = uri    
+            import_map["./" + rel_path] = uri   
+            import_map[js_file.name] = uri      
+            import_map["./" + js_file.name] = uri
+            
+        import_map_tag = ""
+        if import_map:
+            import_map_tag = f'<script type="importmap">\n{json.dumps({"imports": import_map})}\n</script>\n'
+
         all_html = list(root.rglob("*.html")) + list(root.rglob("*.htm"))
         if not all_html:
-            raise ValueError("ZIP mein koi HTML page nahi mila. Pehle build karke dist folder ZIP karein.")
+            raise ValueError("ZIP mein koi HTML page nahi mila.")
         
         def entry_rank(p):
             n = p.name.lower()
@@ -352,7 +365,7 @@ def convert_project_zip(zip_path, output_path):
         parser = SingleHTMLInliner(entry.read_text("utf-8", errors="replace"), entry, site_root)
         result = "".join(parser.output)
         
-        # --- 404 FIX (Router Hijack for React/Vue on Local File) ---
+        # 2. 404 Fix (Router Hijack)
         routing_fix = """
         <script>
         (function() {
@@ -361,25 +374,16 @@ def convert_project_zip(zip_path, output_path):
                 if (!window.location.hash) {
                     try { window.location.hash = '#/'; } catch(e) {}
                 }
+                
+                // Aggressive Pathname override
                 try {
                     var loc = window.location;
                     var proto = Object.getPrototypeOf(loc);
-                    var pathnameDesc = Object.getOwnPropertyDescriptor(proto, 'pathname');
-                    if (pathnameDesc && pathnameDesc.get) {
-                        Object.defineProperty(proto, 'pathname', {
-                            configurable: true,
-                            get: function() {
-                                var hash = window.location.hash;
-                                if (hash && hash.startsWith('#')) {
-                                    var path = hash.substring(1);
-                                    return path.startsWith('/') ? path : '/' + path;
-                                }
-                                return '/';
-                            }
-                        });
-                    }
-                } catch (e) {}
+                    try { Object.defineProperty(loc, 'pathname', { get: function() { return '/'; } }); } catch(e1) {}
+                    try { Object.defineProperty(proto, 'pathname', { get: function() { return '/'; } }); } catch(e2) {}
+                } catch(e) {}
 
+                // History API Hijack
                 var origPush = history.pushState;
                 var origReplace = history.replaceState;
                 history.pushState = function(state, title, url) {
@@ -417,23 +421,20 @@ def convert_project_zip(zip_path, output_path):
         <base href="./">
         """
         
+        head_injection = import_map_tag + routing_fix
+        
         if re.search(r"<head\s*>", result, re.I):
-            result = re.sub(r"<head\s*>", lambda m: "<head>\n" + routing_fix, result, count=1, flags=re.I)
+            result = re.sub(r"<head\s*>", lambda m: "<head>\n" + head_injection, result, count=1, flags=re.I)
         elif re.search(r"<html\s*>", result, re.I):
-            result = re.sub(r"<html\s*>", lambda m: "<html>\n<head>\n" + routing_fix + "</head>", result, count=1, flags=re.I)
+            result = re.sub(r"<html\s*>", lambda m: "<html>\n<head>\n" + head_injection + "</head>", result, count=1, flags=re.I)
         else:
-            result = routing_fix + result
+            result = head_injection + result
 
         marker = '<script>window.MATRIX_KEY = "MATRIX";</script>'
         if re.search(r"</head\s*>", result, re.I):
             result = re.sub(r"</head\s*>", lambda m: marker + "\n</head>", result, count=1, flags=re.I)
         else:
             result = marker + result
-            
-        if re.search(r"<script[^>]+src=[\"'](?:/|\\./)?assets/[^\"']+\\.m?js", result, re.I):
-            raise ValueError("Local JavaScript asset abhi bhi external reh gaya; ZIP ka folder structure check karein.")
-        if re.search(r"<link[^>]+href=[\"'](?:/|\\./)?assets/[^\"']+\\.css", result, re.I):
-            raise ValueError("Local CSS asset abhi bhi external reh gaya; ZIP ka folder structure check karein.")
             
         Path(output_path).write_text(result, encoding="utf-8")
 
