@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-# 𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈 — Telegram Website-to-ZIP Bot
+# 𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈 — Telegram Website-to-ZIP & ZIP-to-HTML Bot
 
 import asyncio
 import ipaddress
-import json
 import os
 import re
 import shutil
@@ -15,7 +14,6 @@ import base64
 import mimetypes
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urldefrag, unquote
-from urllib.request import Request
 from urllib.error import URLError
 from html.parser import HTMLParser
 
@@ -23,7 +21,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.request import HTTPXRequest
-from telegram.error import TimedOut, NetworkError, RetryAfter, BadRequest
+from telegram.error import TimedOut, NetworkError, BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 
 BRAND = "𝑴𝑨𝑻𝑹𝑰𝑿 𝑴𝑶𝑫𝑺 📈"
@@ -34,7 +32,6 @@ OWNER_ID = int(os.getenv("OWNER_ID", "8959111543"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003636772569"))
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/MATRIX_TRADER777").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-# ------------------------------------------------
 
 MAX_FILES = 100
 MAX_FILE_BYTES = 3 * 1024 * 1024
@@ -48,7 +45,7 @@ last_request = {}
 MAX_UPLOAD_ZIP = 19 * 1024 * 1024
 MAX_UNPACKED_BYTES = 150 * 1024 * 1024
 
-
+# ================= WEBSITE TO ZIP LOGIC =================
 class LinkParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -65,11 +62,9 @@ class LinkParser(HTMLParser):
                 if candidate:
                     self.links.append(candidate[0])
 
-
 def clean_name(value):
     value = re.sub(r"[^\w.-]+", "_", value.strip(), flags=re.UNICODE)
     return value.strip("._")[:55] or "website_backup"
-
 
 def safe_public_url(url):
     url, _ = urldefrag(url.strip())
@@ -93,7 +88,6 @@ def safe_public_url(url):
     except Exception:
         return None
     return p.geturl()
-
 
 def fetch_public(url):
     session = requests.Session()
@@ -128,7 +122,6 @@ def fetch_public(url):
         return b"".join(chunks), content_type, current
     raise ValueError("Too many redirects")
 
-
 def local_path(url, host):
     p = urlparse(url)
     path = unquote(p.path or "/")
@@ -144,7 +137,6 @@ def local_path(url, host):
         suffix = re.sub(r"\W+", "_", p.query)[:30]
         rel = rel.with_name(rel.stem + "_" + suffix + rel.suffix)
     return Path(clean_name(host)) / rel
-
 
 def build_zip(start_url, zip_base, work_dir):
     host = urlparse(start_url).netloc.lower()
@@ -194,8 +186,6 @@ def build_zip(start_url, zip_base, work_dir):
                     absolute = safe_public_url(urljoin(url, ref))
                     if absolute and urlparse(absolute).netloc.lower() == host and absolute not in seen:
                         queue.append(absolute)
-        except (requests.RequestException, URLError, TimeoutError, ValueError, OSError):
-            continue
         except Exception:
             continue
         time.sleep(0.03)
@@ -205,12 +195,7 @@ def build_zip(start_url, zip_base, work_dir):
 
     readme = work / "MATRIX_MODS_INFO.txt"
     readme.write_text(
-        f"{BRAND}\nWEBSITE TO ZIP BACKUP\n\n"
-        f"Source website: {start_url}\n"
-        f"Files included: {len(saved)}\n\n"
-        "This archive contains only publicly accessible pages and static assets.\n"
-        "Server-side code (PHP/Python), databases, private/protected files and login-only content are not included.\n"
-        "Use only for websites you own or have permission to back up.\n",
+        f"{BRAND}\nWEBSITE TO ZIP BACKUP\n\nSource: {start_url}\nFiles: {len(saved)}\n",
         encoding="utf-8"
     )
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -218,16 +203,245 @@ def build_zip(start_url, zip_base, work_dir):
             if file.is_file():
                 zf.write(file, file.relative_to(work))
     if zip_path.stat().st_size > MAX_ZIP_BYTES:
-        raise RuntimeError("ZIP is too large for Telegram delivery (45 MB limit).")
+        raise RuntimeError("ZIP is too large for Telegram (45 MB limit).")
     return zip_path, len(saved)
 
 
-def user_label(user):
-    name = " ".join(x for x in [user.first_name, user.last_name] if x) or "Not set"
-    username = f"@{user.username}" if user.username else "Not set"
-    return name, username
+# ================= ZIP TO HTML LOGIC =================
+def extract_project_zip(zip_path, root):
+    total = 0
+    with zipfile.ZipFile(zip_path) as zf:
+        if len(zf.infolist()) > 5000:
+            raise ValueError("ZIP mein 5000 se zyada files hain.")
+        for item in zf.infolist():
+            target = (root / item.filename.replace("\\", "/")).resolve()
+            if target != root.resolve() and root.resolve() not in target.parents:
+                raise ValueError("ZIP mein unsafe path mila.")
+            total += item.file_size
+            if total > MAX_UNPACKED_BYTES:
+                raise ValueError("Extracted ZIP 150 MB se badi hai.")
+            if item.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(item) as src, target.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
 
-# ---------------- FORCE JOIN + MENU ----------------
+def asset_data_uri(path):
+    mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+    return "data:%s;base64,%s" % (mime, base64.b64encode(path.read_bytes()).decode("ascii"))
+
+def local_asset(base_dir, value, root):
+    value = (value or "").strip()
+    if not value or value.startswith(("#", "data:", "blob:", "http:", "https:", "//", "javascript:", "mailto:")):
+        return None
+    value = value.split("#", 1)[0].split("?", 1)[0]
+    decoded = unquote(value)
+    if decoded.startswith("/"):
+        decoded = decoded.lstrip("/")
+        path = (root / decoded).resolve()
+    else:
+        path = (base_dir / decoded).resolve()
+    return path if path.is_file() and (path == root or root in path.parents) else None
+
+def inline_css_assets(css, css_path, root, seen=None):
+    seen = seen or set()
+    import_re = re.compile(r"""@import\s+(?:url\()?["']?([^"')\s;]+)["']?\)?\s*;""", re.I)
+    def replace_import(match):
+        asset = local_asset(css_path.parent, match.group(1), root)
+        if not asset or asset.suffix.lower() != ".css" or asset in seen:
+            return match.group(0)
+        seen.add(asset)
+        return inline_css_assets(asset.read_text("utf-8", errors="replace"), asset, root, seen)
+    css = import_re.sub(replace_import, css)
+    url_re = re.compile(r"""url\(\s*(["']?)(.*?)\1\s*\)""", re.I)
+    def replace_url(match):
+        asset = local_asset(css_path.parent, match.group(2), root)
+        return "url('%s')" % asset_data_uri(asset) if asset else match.group(0)
+    return url_re.sub(replace_url, css)
+
+class SingleHTMLInliner(HTMLParser):
+    def __init__(self, source, entry, root):
+        super().__init__(convert_charrefs=False)
+        self.entry, self.root, self.output = entry, root, []
+        self.feed(source)
+
+    def handle_starttag(self, tag, attrs):
+        values = dict(attrs)
+        tag_lower = tag.lower()
+        
+        # 404 FIX: Remove Vite modulepreload tags to prevent missing chunk errors
+        if tag_lower == "link" and values.get("rel") == "modulepreload":
+            return
+
+        if tag_lower == "link" and values.get("href"):
+            asset = local_asset(self.entry.parent, values["href"], self.root)
+            if asset and "stylesheet" in values.get("rel", "").lower() and asset.suffix.lower() == ".css":
+                css = inline_css_assets(asset.read_text("utf-8", errors="replace"), asset, self.root)
+                self.output.append("<style>\n" + css + "\n</style>")
+                return
+            if asset and "icon" in values.get("rel", "").lower():
+                values["href"] = asset_data_uri(asset)
+                
+        if tag_lower == "script" and values.get("src"):
+            asset = local_asset(self.entry.parent, values["src"], self.root)
+            if asset and asset.suffix.lower() in (".js", ".mjs"):
+                attrs_text = "".join(
+                    ' %s="%s"' % (k, v)
+                    for k, v in attrs
+                    if k.lower() not in ("src", "defer", "async", "crossorigin", "integrity")
+                    and v is not None
+                )
+                js_text = asset.read_text("utf-8", errors="replace")
+                js_text = re.sub(r"</script", r"<\\/script", js_text, flags=re.I)
+                self.output.append("<script%s>\n%s\n</script>" % (attrs_text, js_text))
+                return
+                
+        for attr in ("src", "poster"):
+            if values.get(attr):
+                asset = local_asset(self.entry.parent, values[attr], self.root)
+                if asset:
+                    values[attr] = asset_data_uri(asset)
+                    
+        if values.get("srcset"):
+            candidates = []
+            for part in values["srcset"].split(","):
+                bits = part.strip().split()
+                if bits:
+                    asset = local_asset(self.entry.parent, bits[0], self.root)
+                    if asset:
+                        bits[0] = asset_data_uri(asset)
+                    candidates.append(" ".join(bits))
+            values["srcset"] = ", ".join(candidates)
+            
+        attrs_text = "".join(
+            (' %s="%s"' % (k, (v or "").replace("&", "&amp;").replace('"', "&quot;")))
+            if v is not None else " " + k for k, v in values.items()
+        )
+        self.output.append("<%s%s>" % (tag, attrs_text))
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        self.output.append("</%s>" % tag)
+    def handle_endtag(self, tag): self.output.append("</%s>" % tag)
+    def handle_data(self, data): self.output.append(data)
+    def handle_entityref(self, name): self.output.append("&%s;" % name)
+    def handle_charref(self, name): self.output.append("&#%s;" % name)
+    def handle_comment(self, data): self.output.append("<!--%s-->" % data)
+
+def convert_project_zip(zip_path, output_path):
+    with tempfile.TemporaryDirectory(prefix="matrix_html_") as td:
+        root = Path(td) / "project"
+        root.mkdir()
+        extract_project_zip(zip_path, root)
+        all_html = list(root.rglob("*.html")) + list(root.rglob("*.htm"))
+        if not all_html:
+            raise ValueError("ZIP mein koi HTML page nahi mila.")
+        
+        def entry_rank(p):
+            n = p.name.lower()
+            priority = 0 if n == "index.html" else 1 if n == "index.htm" else 2 if n == "main.html" else 3
+            return (priority, len(p.relative_to(root).parts), str(p).lower())
+        
+        all_html.sort(key=entry_rank)
+        entry = all_html[0]
+        site_root = entry.parent.resolve()
+        parser = SingleHTMLInliner(entry.read_text("utf-8", errors="replace"), entry, site_root)
+        result = "".join(parser.output)
+        
+        # --- SUPER-STRONG HASH ROUTER PATCH (Fixes React/Vue 404 on local files) ---
+        routing_fix = """
+        <script>
+        (function() {
+            var isLocal = window.location.protocol === 'file:' || window.location.protocol === 'content:';
+            if (isLocal) {
+                // 1. Ensure we have a hash, default to '#/'
+                if (!window.location.hash) {
+                    window.history.replaceState(null, '', '#/');
+                }
+
+                // 2. Override Location prototype getters to trick React Router
+                try {
+                    var loc = window.location;
+                    var proto = Object.getPrototypeOf(loc);
+                    var pathnameDesc = Object.getOwnPropertyDescriptor(proto, 'pathname');
+                    
+                    if (pathnameDesc && pathnameDesc.get) {
+                        Object.defineProperty(loc, 'pathname', {
+                            configurable: true,
+                            get: function() {
+                                var hash = window.location.hash;
+                                if (hash && hash.startsWith('#')) {
+                                    var path = hash.substring(1);
+                                    return path.startsWith('/') ? path : '/' + path;
+                                }
+                                return '/';
+                            }
+                        });
+                    }
+                } catch (e) { console.log("Location override failed", e); }
+
+                // 3. Hijack history API to use hash
+                var origPush = history.pushState;
+                var origReplace = history.replaceState;
+
+                history.pushState = function(state, title, url) {
+                    if (url && url.startsWith('/') && !url.startsWith('//')) {
+                        window.location.hash = url;
+                    } else {
+                        origPush.apply(history, arguments);
+                    }
+                };
+                
+                history.replaceState = function(state, title, url) {
+                    if (url && url.startsWith('/') && !url.startsWith('//')) {
+                        var newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname + window.location.search + '#' + url;
+                        origReplace.call(history, state, title, newUrl);
+                    } else {
+                        origReplace.apply(history, arguments);
+                    }
+                };
+
+                // 4. Listen to hash changes and dispatch popstate
+                window.addEventListener('hashchange', function() {
+                    var event = new PopStateEvent('popstate', { state: null });
+                    window.dispatchEvent(event);
+                });
+                
+                // 5. Intercept clicks
+                document.addEventListener('click', function(e) {
+                    var a = e.target.closest('a');
+                    if (a) {
+                        var href = a.getAttribute('href');
+                        if (href && href.startsWith('/') && !href.startsWith('//')) {
+                            e.preventDefault();
+                            window.location.hash = href;
+                        }
+                    }
+                }, true);
+            }
+        })();
+        </script>
+        <base href="./">
+        """
+        
+        if re.search(r"<head\s*>", result, re.I):
+            result = re.sub(r"<head\s*>", lambda m: "<head>\n" + routing_fix, result, count=1, flags=re.I)
+        elif re.search(r"<html\s*>", result, re.I):
+            result = re.sub(r"<html\s*>", lambda m: "<html>\n<head>\n" + routing_fix + "</head>", result, count=1, flags=re.I)
+        else:
+            result = routing_fix + result
+
+        marker = '<script>window.MATRIX_KEY = "MATRIX";</script>'
+        if re.search(r"</head\s*>", result, re.I):
+            result = re.sub(r"</head\s*>", lambda m: marker + "\n</head>", result, count=1, flags=re.I)
+        else:
+            result = marker + result
+            
+        Path(output_path).write_text(result, encoding="utf-8")
+
+
+# ================= BOT HANDLERS & FORCE JOIN =================
 def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🌐 Website → ZIP", callback_data="feature_zip"),
@@ -332,7 +546,6 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         await query.message.reply_text("👑 <b>BOT OWNER</b>\nSupport ke liye channel join karein.", reply_markup=main_keyboard(), parse_mode="HTML")
 
-
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.message
@@ -359,7 +572,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Invalid ya non-public website URL. Public http/https URL bhejein.")
         return
 
-    name, username = user_label(user)
     await message.reply_text(f"📈 {BRAND}\n\n⏳ Website process ho rahi hai...\nPlease wait. ZIP ready hone par yahin milegi.")
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
 
@@ -371,228 +583,15 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with zip_path.open("rb") as f:
                 await context.bot.send_document(chat_id=message.chat_id, document=f, filename=f"{zip_base}_MATRIX_MODS.zip", caption=caption)
 
-            owner_caption = (
-                f"📈 {BRAND} — NEW ZIP REQUEST\n━━━━━━━━━━━━━━━━━━\n"
-                f"👤 Name: {name}\n🔖 Username: {username}\n🆔 User ID: {user.id}\n"
-                f"🌐 Website: {start_url}\n📦 ZIP: {zip_base}_MATRIX_MODS.zip\n📁 Files: {count}\n✅ Delivery to user: sent\n"
-            )
             try:
-                await context.bot.send_message(chat_id=OWNER_ID, text=owner_caption)
+                await context.bot.send_message(chat_id=OWNER_ID, text=f"New ZIP Request from {user.id} | {start_url}")
                 with zip_path.open("rb") as f:
                     await context.bot.send_document(chat_id=OWNER_ID, document=f, filename=f"{zip_base}_MATRIX_MODS.zip")
-            except Exception as owner_error:
-                print("Owner notification failed:", owner_error)
+            except Exception:
+                pass
 
         except Exception as exc:
             await message.reply_text(f"❌ ZIP nahi ban paya.\nReason: {str(exc)[:250]}")
-
-
-async def post_init(application: Application):
-    print(f"{BRAND} bot started successfully.")
-
-
-# ---------------- ZIP -> SINGLE HTML FEATURE ----------------
-def extract_project_zip(zip_path, root):
-    total = 0
-    with zipfile.ZipFile(zip_path) as zf:
-        if len(zf.infolist()) > 5000:
-            raise ValueError("ZIP mein 5000 se zyada files hain.")
-        for item in zf.infolist():
-            target = (root / item.filename.replace("\\", "/")).resolve()
-            if target != root.resolve() and root.resolve() not in target.parents:
-                raise ValueError("ZIP mein unsafe path mila.")
-            total += item.file_size
-            if total > MAX_UNPACKED_BYTES:
-                raise ValueError("Extracted ZIP 150 MB se badi hai.")
-            if item.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
-            else:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(item) as src, target.open("wb") as dst:
-                    shutil.copyfileobj(src, dst)
-
-def asset_data_uri(path):
-    mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-    return "data:%s;base64,%s" % (mime, base64.b64encode(path.read_bytes()).decode("ascii"))
-
-def local_asset(base_dir, value, root):
-    value = (value or "").strip()
-    if not value or value.startswith(("#", "data:", "blob:", "http:", "https:", "//", "javascript:", "mailto:")):
-        return None
-    value = value.split("#", 1)[0].split("?", 1)[0]
-    decoded = unquote(value)
-    if decoded.startswith("/"):
-        decoded = decoded.lstrip("/")
-        path = (root / decoded).resolve()
-    else:
-        path = (base_dir / decoded).resolve()
-    return path if path.is_file() and (path == root or root in path.parents) else None
-
-def inline_css_assets(css, css_path, root, seen=None):
-    seen = seen or set()
-    import_re = re.compile(r"""@import\s+(?:url\()?["']?([^"')\s;]+)["']?\)?\s*;""", re.I)
-    def replace_import(match):
-        asset = local_asset(css_path.parent, match.group(1), root)
-        if not asset or asset.suffix.lower() != ".css" or asset in seen:
-            return match.group(0)
-        seen.add(asset)
-        return inline_css_assets(asset.read_text("utf-8", errors="replace"), asset, root, seen)
-    css = import_re.sub(replace_import, css)
-    url_re = re.compile(r"""url\(\s*(["']?)(.*?)\1\s*\)""", re.I)
-    def replace_url(match):
-        asset = local_asset(css_path.parent, match.group(2), root)
-        return "url('%s')" % asset_data_uri(asset) if asset else match.group(0)
-    return url_re.sub(replace_url, css)
-
-class SingleHTMLInliner(HTMLParser):
-    def __init__(self, source, entry, root):
-        super().__init__(convert_charrefs=False)
-        self.entry, self.root, self.output = entry, root, []
-        self.feed(source)
-
-    def handle_starttag(self, tag, attrs):
-        values = dict(attrs)
-        tag_lower = tag.lower()
-        
-        # 404 FIX: Remove Vite modulepreload tags
-        if tag_lower == "link" and values.get("rel") == "modulepreload":
-            return
-
-        if tag_lower == "link" and values.get("href"):
-            asset = local_asset(self.entry.parent, values["href"], self.root)
-            if asset and "stylesheet" in values.get("rel", "").lower() and asset.suffix.lower() == ".css":
-                css = inline_css_assets(asset.read_text("utf-8", errors="replace"), asset, self.root)
-                self.output.append("<style>\n" + css + "\n</style>")
-                return
-            if asset and "icon" in values.get("rel", "").lower():
-                values["href"] = asset_data_uri(asset)
-                
-        if tag_lower == "script" and values.get("src"):
-            asset = local_asset(self.entry.parent, values["src"], self.root)
-            if asset and asset.suffix.lower() in (".js", ".mjs"):
-                attrs_text = "".join(
-                    ' %s="%s"' % (k, v)
-                    for k, v in attrs
-                    if k.lower() not in ("src", "defer", "async", "crossorigin", "integrity")
-                    and v is not None
-                )
-                js_text = asset.read_text("utf-8", errors="replace")
-                js_text = re.sub(r"</script", r"<\\/script", js_text, flags=re.I)
-                self.output.append("<script%s>\n%s\n</script>" % (attrs_text, js_text))
-                return
-                
-        for attr in ("src", "poster"):
-            if values.get(attr):
-                asset = local_asset(self.entry.parent, values[attr], self.root)
-                if asset:
-                    values[attr] = asset_data_uri(asset)
-                    
-        if values.get("srcset"):
-            candidates = []
-            for part in values["srcset"].split(","):
-                bits = part.strip().split()
-                if bits:
-                    asset = local_asset(self.entry.parent, bits[0], self.root)
-                    if asset:
-                        bits[0] = asset_data_uri(asset)
-                    candidates.append(" ".join(bits))
-            values["srcset"] = ", ".join(candidates)
-            
-        attrs_text = "".join(
-            (' %s="%s"' % (k, (v or "").replace("&", "&amp;").replace('"', "&quot;")))
-            if v is not None else " " + k for k, v in values.items()
-        )
-        self.output.append("<%s%s>" % (tag, attrs_text))
-
-    def handle_startendtag(self, tag, attrs):
-        self.handle_starttag(tag, attrs)
-        self.output.append("</%s>" % tag)
-    def handle_endtag(self, tag): self.output.append("</%s>" % tag)
-    def handle_data(self, data): self.output.append(data)
-    def handle_entityref(self, name): self.output.append("&%s;" % name)
-    def handle_charref(self, name): self.output.append("&#%s;" % name)
-    def handle_comment(self, data): self.output.append("<!--%s-->" % data)
-
-
-def convert_project_zip(zip_path, output_path):
-    with tempfile.TemporaryDirectory(prefix="matrix_html_") as td:
-        root = Path(td) / "project"
-        root.mkdir()
-        extract_project_zip(zip_path, root)
-        all_html = list(root.rglob("*.html")) + list(root.rglob("*.htm"))
-        if not all_html:
-            raise ValueError("ZIP mein koi HTML page nahi mila.")
-        
-        def entry_rank(p):
-            n = p.name.lower()
-            priority = 0 if n == "index.html" else 1 if n == "index.htm" else 2 if n == "main.html" else 3
-            return (priority, len(p.relative_to(root).parts), str(p).lower())
-        
-        all_html.sort(key=entry_rank)
-        entry = all_html[0]
-        site_root = entry.parent.resolve()
-        parser = SingleHTMLInliner(entry.read_text("utf-8", errors="replace"), entry, site_root)
-        result = "".join(parser.output)
-        
-        # --- FORCE HASH ROUTER PATCH (Fixes 404 on local files) ---
-        routing_fix = """
-        <script>
-        (function() {
-            var isLocal = window.location.protocol === 'file:' || window.location.protocol === 'content:';
-            if (isLocal) {
-                if (!window.location.hash) {
-                    var path = window.location.pathname;
-                    if (!path || path.endsWith('.html')) { path = '/'; }
-                    window.history.replaceState(null, '', '#' + path);
-                }
-                var originalPushState = window.history.pushState;
-                var originalReplaceState = window.history.replaceState;
-
-                window.history.pushState = function(state, title, url) {
-                    if (url && url.startsWith('/') && !url.startsWith('//')) {
-                        window.location.hash = url;
-                        return;
-                    }
-                    return originalPushState.apply(this, arguments);
-                };
-                window.history.replaceState = function(state, title, url) {
-                    if (url && url.startsWith('/') && !url.startsWith('//')) {
-                        window.location.replace('#' + url);
-                        return;
-                    }
-                    return originalReplaceState.apply(this, arguments);
-                };
-                document.addEventListener('click', function(e) {
-                    var a = e.target.closest('a');
-                    if (a) {
-                        var href = a.getAttribute('href');
-                        if (href && href.startsWith('/') && !href.startsWith('//')) {
-                            e.preventDefault();
-                            window.location.hash = href;
-                        }
-                    }
-                }, true);
-            }
-        })();
-        </script>
-        <base href="./">
-        """
-        
-        if re.search(r"<head\s*>", result, re.I):
-            result = re.sub(r"<head\s*>", lambda m: "<head>\n" + routing_fix, result, count=1, flags=re.I)
-        elif re.search(r"<html\s*>", result, re.I):
-            result = re.sub(r"<html\s*>", lambda m: "<html>\n<head>\n" + routing_fix + "</head>", result, count=1, flags=re.I)
-        else:
-            result = routing_fix + result
-
-        marker = '<script>window.MATRIX_KEY = "MATRIX";</script>'
-        if re.search(r"</head\s*>", result, re.I):
-            result = re.sub(r"</head\s*>", lambda m: marker + "\n</head>", result, count=1, flags=re.I)
-        else:
-            result = marker + result
-            
-        Path(output_path).write_text(result, encoding="utf-8")
-
 
 async def handle_uploaded_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user, message, doc = update.effective_user, update.message, update.message.document
@@ -626,17 +625,13 @@ async def handle_uploaded_zip(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             if user and user.id != OWNER_ID:
                 try:
-                    await context.bot.send_message(chat_id=OWNER_ID, text=f"📦 ZIP → HTML request\nUser: {user.id} (@{user.username or 'no username'})")
-                    with original_zip.open("rb") as f:
-                        await context.bot.send_document(chat_id=OWNER_ID, document=f, filename=doc.file_name or "source.zip", caption=f"Original ZIP from user {user.id}")
                     with html_path.open("rb") as f:
-                        await context.bot.send_document(chat_id=OWNER_ID, document=f, filename="MATRIX_SINGLE.html", caption=f"Generated HTML for user {user.id}")
-                except Exception as owner_exc:
-                    print("Owner delivery failed:", str(owner_exc))
+                        await context.bot.send_document(chat_id=OWNER_ID, document=f, filename="MATRIX_SINGLE.html", caption=f"HTML for user {user.id}")
+                except Exception:
+                    pass
             await status.delete()
         except Exception as exc:
             await status.edit_text("❌ HTML conversion failed: " + str(exc)[:500])
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -645,8 +640,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await is_member(context.bot, user.id) if user else False
     if status is not True:
         await update.message.reply_text(
-            f"✨ <b>WELCOME TO {BRAND}</b>\n\n"
-            "Premium website utility bot. Features unlock karne ke liye pehle channel join karein.",
+            f"✨ <b>WELCOME TO {BRAND}</b>\n\nPremium website utility bot. Features unlock karne ke liye pehle channel join karein.",
             reply_markup=join_keyboard(), parse_mode="HTML"
         )
         return
@@ -674,6 +668,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_keyboard(), parse_mode="HTML"
     )
 
+async def post_init(application: Application):
+    print(f"{BRAND} bot started successfully.")
+
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     error = context.error
     if isinstance(error, TimedOut):
@@ -683,11 +680,11 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     else:
         print(f"Unhandled bot error: {error!r}")
 
-
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN missing in Environment Variables.")
 
+    # Render par bade files bhejne ke liye extended timeouts
     bot_request = HTTPXRequest(connection_pool_size=20, connect_timeout=30, read_timeout=120, write_timeout=120, media_write_timeout=240, pool_timeout=30)
     polling_request = HTTPXRequest(connection_pool_size=4, connect_timeout=30, read_timeout=60, write_timeout=30, pool_timeout=30)
 
