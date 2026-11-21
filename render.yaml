@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: matrix-mods-telegram-bot
     runtime: python
     plan: free
@@ -11,6 +11,13 @@ services:
       - key: OWNER_ID
         value: "8959111543"
       - key: CHANNEL_ID
-        value: "-1004473792888"
+        value: "-1003636772569"
       - key: CHANNEL_LINK
-        value: "https://t.me/+zrivpvZr3S1mODVl"
+        value: "https://t.me/MATRIX_TRADER777"
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          type: web
+          name: matrix-mods-telegram-bot
+          envVarKey: RENDER_EXTERNAL_URL
