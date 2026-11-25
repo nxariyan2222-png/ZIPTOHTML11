@@ -127,13 +127,24 @@ def fetch_public(url):
         return b"".join(chunks), content_type, current
     raise ValueError("Too many redirects")
 
-def local_path(url, host):
+def local_path(url, host, content_type=""):
+    """Preserve real asset extensions; extensionless URLs use their MIME type."""
     p = urlparse(url)
     path = unquote(p.path or "/")
     if path.endswith("/"):
         path += "index.html"
-    if not Path(path).suffix:
-        path += ".html"
+    suffix = Path(path).suffix.lower()
+    if not suffix:
+        mime = (content_type or "").split(";", 1)[0].strip().lower()
+        guessed = mimetypes.guess_extension(mime) if mime else None
+        # Normalize common MIME aliases to browser-friendly extensions.
+        ext_map = {
+            "text/html": ".html", "application/javascript": ".js",
+            "text/javascript": ".js", "application/x-javascript": ".js",
+            "text/css": ".css", "image/svg+xml": ".svg",
+            "application/json": ".json", "font/woff2": ".woff2",
+        }
+        path += ext_map.get(mime, guessed or ".bin")
     parts = [x for x in path.split("/") if x not in ("", ".", "..")]
     if not parts:
         parts = ["index.html"]
@@ -166,7 +177,7 @@ def build_zip(start_url, zip_base, work_dir):
                 continue
             if total_bytes + len(data) > MAX_TOTAL_BYTES:
                 break
-            target = work / local_path(url, host)
+            target = work / local_path(url, host, content_type)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
             saved.append(target)
@@ -503,8 +514,9 @@ def convert_project_zip(zip_path, output_path):
 # ================= BOT HANDLERS & FORCE JOIN =================
 def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 Website → ZIP", callback_data="feature_zip"),
+        [InlineKeyboardButton("🌐 Link → ZIP", callback_data="feature_zip"),
          InlineKeyboardButton("📦 ZIP → HTML", callback_data="feature_html")],
+        [InlineKeyboardButton("⚡ Link → HTML", callback_data="feature_link_html")],
         [InlineKeyboardButton("📖 How to use", callback_data="help"),
          InlineKeyboardButton("👑 Owner", callback_data="owner")],
         [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_LINK)],
@@ -589,16 +601,49 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "help":
         await query.answer()
-        await query.message.reply_text("📚 <b>HOW TO USE</b>\n\n🌐 Website ZIP: URL bhejein.\n📦 ZIP to HTML: .zip document upload karein.", reply_markup=main_keyboard(), parse_mode="HTML")
+        await query.message.reply_text("📚 <b>HOW TO USE</b>\n\n🌐 Link → ZIP: website URL bhejein.\n📦 ZIP → HTML: .zip document upload karein.\n⚡ Link → HTML: website URL bhejein.", reply_markup=main_keyboard(), parse_mode="HTML")
     elif data == "feature_zip":
+        context.user_data["url_mode"] = "zip"
         await query.answer()
-        await query.message.reply_text("🌐 <b>WEBSITE → ZIP</b>\nPublic website ka https:// URL yahan send karein.", reply_markup=main_keyboard(), parse_mode="HTML")
+        await query.message.reply_text("🌐 <b>LINK → ZIP</b>\nPublic website ka https:// URL bhejein. ZIP file ke format mein milegi.", reply_markup=main_keyboard(), parse_mode="HTML")
     elif data == "feature_html":
+        context.user_data["url_mode"] = "zip"
         await query.answer()
         await query.message.reply_text("📦 <b>ZIP → SINGLE HTML</b>\nApni website ki .zip file document ke roop mein upload karein.", reply_markup=main_keyboard(), parse_mode="HTML")
+    elif data == "feature_link_html":
+        context.user_data["url_mode"] = "link_html"
+        await query.answer()
+        await query.message.reply_text("⚡ <b>LINK → SINGLE HTML</b>\nPublic website ka https:// URL bhejein. Pehle ZIP banegi, phir single HTML.", reply_markup=main_keyboard(), parse_mode="HTML")
     elif data == "owner":
         await query.answer()
         await query.message.reply_text("👑 <b>BOT OWNER</b>\nSupport ke liye channel join karein.", reply_markup=main_keyboard(), parse_mode="HTML")
+
+async def owner_log(context, user, operation, details, result_path=None, result_name=None):
+    """Send a usage audit to the configured owner; include file result when present."""
+    if not user:
+        return
+    username = f"@{user.username}" if user.username else "(no username)"
+    report = (
+        f"📥 MATRIX BOT USAGE\n"
+        f"User: {user.full_name}\n"
+        f"Username: {username}\n"
+        f"Telegram ID: {user.id}\n"
+        f"Operation: {operation}\n"
+        f"Details: {details}"
+    )
+    try:
+        await context.bot.send_message(chat_id=OWNER_ID, text=report)
+        if result_path and Path(result_path).is_file():
+            with Path(result_path).open("rb") as file_obj:
+                await context.bot.send_document(
+                    chat_id=OWNER_ID,
+                    document=file_obj,
+                    filename=result_name or Path(result_path).name,
+                    caption=f"Owner copy • user ID {user.id} • {operation}",
+                )
+    except Exception as exc:
+        # Logging must never break the user's conversion; expose owner-delivery issues.
+        print(f"Owner report delivery failed for user {user.id}: {exc}")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -626,18 +671,39 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Invalid ya non-public website URL.")
         return
 
-    await message.reply_text(f"📈 {BRAND}\n\n⏳ Website process ho rahi hai...\nPlease wait. ZIP ready hone par yahin milegi.")
+    mode = context.user_data.get("url_mode", "zip")
+    operation = "LINK → HTML" if mode == "link_html" else "LINK → ZIP"
+    await owner_log(context, user, operation, f"URL: {start_url}\nStatus: started")
+    await message.reply_text(f"📈 {BRAND}\n\n⏳ {operation} process ho raha hai...\nPlease wait.")
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
 
     with tempfile.TemporaryDirectory(prefix="matrixmods_") as temp:
         zip_base = clean_name(urlparse(start_url).netloc.replace(":", "_") + "_backup")
         try:
             zip_path, count = await asyncio.to_thread(build_zip, start_url, zip_base, temp)
-            caption = f"📈 {BRAND}\n✅ WEBSITE ZIP READY\n🌐 {start_url}\n📁 Files: {count}\n━━━━━━━━━━━━━━━━━━"
-            with zip_path.open("rb") as f:
-                await context.bot.send_document(chat_id=message.chat_id, document=f, filename=f"{zip_base}_MATRIX_MODS.zip", caption=caption)
+            if mode == "link_html":
+                html_path = Path(temp) / "MATRIX_SINGLE.html"
+                await asyncio.to_thread(convert_project_zip, zip_path, html_path)
+                if html_path.stat().st_size > 49 * 1024 * 1024:
+                    raise ValueError("Generated HTML Telegram send limit se badi hai.")
+                with html_path.open("rb") as f:
+                    await context.bot.send_document(
+                        chat_id=message.chat_id, document=f,
+                        filename="MATRIX_SINGLE.html",
+                        caption=f"✅ LINK → SINGLE HTML READY\n🌐 {start_url}\n📁 Source files: {count}",
+                    )
+                await owner_log(context, user, operation, f"URL: {start_url}\nFiles: {count}\nStatus: success", html_path, "MATRIX_SINGLE.html")
+            else:
+                with zip_path.open("rb") as f:
+                    await context.bot.send_document(
+                        chat_id=message.chat_id, document=f,
+                        filename=f"{zip_base}_MATRIX_MODS.zip",
+                        caption=f"📈 {BRAND}\n✅ WEBSITE ZIP READY\n🌐 {start_url}\n📁 Files: {count}",
+                    )
+                await owner_log(context, user, operation, f"URL: {start_url}\nFiles: {count}\nStatus: success", zip_path, f"{zip_base}_MATRIX_MODS.zip")
         except Exception as exc:
-            await message.reply_text(f"❌ ZIP nahi ban paya.\nReason: {str(exc)[:250]}")
+            await message.reply_text(f"❌ {operation} nahi ban paya.\nReason: {str(exc)[:250]}")
+            await owner_log(context, user, operation, f"URL: {start_url}\nStatus: failed\nError: {str(exc)[:300]}")
 
 async def handle_uploaded_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user, message, doc = update.effective_user, update.message, update.message.document
@@ -651,6 +717,7 @@ async def handle_uploaded_zip(update: Update, context: ContextTypes.DEFAULT_TYPE
     if doc.file_size and doc.file_size > MAX_UPLOAD_ZIP:
         await message.reply_text("❌ ZIP 19 MB se chhoti honi chahiye.")
         return
+    await owner_log(context, user, "ZIP → HTML", f"Uploaded file: {doc.file_name}\nTelegram file ID: {doc.file_id}\nStatus: started")
     status = await message.reply_text("⏳ ZIP se single HTML ban raha hai...")
     with tempfile.TemporaryDirectory(prefix="matrix_upload_") as td:
         td = Path(td)
@@ -669,8 +736,10 @@ async def handle_uploaded_zip(update: Update, context: ContextTypes.DEFAULT_TYPE
                 caption="✅ Single HTML ready. 404 error fix ho gaya hai."
             )
             await status.delete()
+            await owner_log(context, user, "ZIP → HTML", f"Uploaded file: {doc.file_name}\nStatus: success", html_path, "MATRIX_SINGLE.html")
         except Exception as exc:
             await status.edit_text("❌ HTML conversion failed: " + str(exc)[:500])
+            await owner_log(context, user, "ZIP → HTML", f"Uploaded file: {doc.file_name}\nStatus: failed\nError: {str(exc)[:300]}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -690,8 +759,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"╚════════════════════╝\n\n"
         "🚀 <b>ALL-IN-ONE WEBSITE TOOLKIT</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🌐 <b>Website → ZIP</b> — public website backup\n"
-        "📦 <b>ZIP → Single HTML</b> — project assets inline\n"
+        "🌐 <b>Link → ZIP</b> — website backup\n"
+        "📦 <b>ZIP → HTML</b> — project assets inline\n"
+        "⚡ <b>Link → HTML</b> — direct single HTML conversion\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Neeche menu se feature select karein.",
         reply_markup=main_keyboard(), parse_mode="HTML"
@@ -702,8 +772,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "📚 <b>HELP CENTER</b>\n\n"
-        "🌐 Website-to-ZIP: public http/https URL bhejein.\n"
-        "📦 ZIP-to-HTML: .zip document upload karein.",
+        "🌐 Link-to-ZIP: public http/https URL bhejein.\n"
+        "📦 ZIP-to-HTML: .zip document upload karein.\n"
+        "⚡ Link-to-HTML: public website URL bhejein.",
         reply_markup=main_keyboard(), parse_mode="HTML"
     )
 
