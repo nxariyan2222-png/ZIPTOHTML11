@@ -522,6 +522,13 @@ def main_keyboard():
         [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_LINK)],
     ])
 
+def link_choice_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐  WEBSITE → ZIP", callback_data="choose_link_zip")],
+        [InlineKeyboardButton("⚡  WEBSITE → SINGLE HTML", callback_data="choose_link_html")],
+        [InlineKeyboardButton("✖  Cancel", callback_data="cancel_link")],
+    ])
+
 def join_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 JOIN CHANNEL", url=CHANNEL_LINK)],
@@ -601,19 +608,28 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "help":
         await query.answer()
-        await query.message.reply_text("📚 <b>HOW TO USE</b>\n\n🌐 Link → ZIP: website URL bhejein.\n📦 ZIP → HTML: .zip document upload karein.\n⚡ Link → HTML: website URL bhejein.", reply_markup=main_keyboard(), parse_mode="HTML")
+        await query.message.reply_text("📚 <b>HOW TO USE</b>\n\n🌐 Website link bhejein — bot pehle task select karwayega.\n📦 ZIP → HTML: .zip document upload karein.\n⚡ Link → HTML: link select menu se choose karein.", reply_markup=main_keyboard(), parse_mode="HTML")
     elif data == "feature_zip":
-        context.user_data["url_mode"] = "zip"
         await query.answer()
-        await query.message.reply_text("🌐 <b>LINK → ZIP</b>\nPublic website ka https:// URL bhejein. ZIP file ke format mein milegi.", reply_markup=main_keyboard(), parse_mode="HTML")
+        await query.message.reply_text("🌐 <b>WEBSITE BACKUP</b>\nWebsite URL bhejiye. Link milne ke baad aap task choose kar sakte hain.", reply_markup=main_keyboard(), parse_mode="HTML")
     elif data == "feature_html":
-        context.user_data["url_mode"] = "zip"
         await query.answer()
         await query.message.reply_text("📦 <b>ZIP → SINGLE HTML</b>\nApni website ki .zip file document ke roop mein upload karein.", reply_markup=main_keyboard(), parse_mode="HTML")
     elif data == "feature_link_html":
-        context.user_data["url_mode"] = "link_html"
         await query.answer()
-        await query.message.reply_text("⚡ <b>LINK → SINGLE HTML</b>\nPublic website ka https:// URL bhejein. Pehle ZIP banegi, phir single HTML.", reply_markup=main_keyboard(), parse_mode="HTML")
+        await query.message.reply_text("⚡ <b>LINK → SINGLE HTML</b>\nWebsite URL bhejiye, phir menu se Single HTML choose karein.", reply_markup=main_keyboard(), parse_mode="HTML")
+    elif data in ("choose_link_zip", "choose_link_html"):
+        await query.answer("Task selected")
+        start_url = context.user_data.pop("pending_url", None)
+        if not start_url:
+            await query.message.reply_text("⌛ Link session expire ho gaya. Website URL dobara bhejein.", reply_markup=main_keyboard())
+            return
+        mode = "link_html" if data == "choose_link_html" else "zip"
+        await process_link_job(context, query.message, query.from_user, start_url, mode)
+    elif data == "cancel_link":
+        context.user_data.pop("pending_url", None)
+        await query.answer("Cancelled")
+        await query.message.reply_text("Task cancelled. Naya website link bhej sakte hain.", reply_markup=main_keyboard())
     elif data == "owner":
         await query.answer()
         await query.message.reply_text("👑 <b>BOT OWNER</b>\nSupport ke liye channel join karein.", reply_markup=main_keyboard(), parse_mode="HTML")
@@ -645,20 +661,100 @@ async def owner_log(context, user, operation, details, result_path=None, result_
         # Logging must never break the user's conversion; expose owner-delivery issues.
         print(f"Owner report delivery failed for user {user.id}: {exc}")
 
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    message = update.message
-    if not user or not message or not message.text:
-        return
-
-    if not await require_membership(update, context):
-        return
-
+async def process_link_job(context, message, user, start_url, mode):
+    """Run the chosen link conversion and keep a polished live status visible."""
     now = time.time()
     if now - last_request.get(user.id, 0) < USER_COOLDOWN:
         await message.reply_text("⏳ Please 20 seconds wait karke dobara try karein.")
         return
     last_request[user.id] = now
+
+    operation = "LINK → HTML" if mode == "link_html" else "LINK → ZIP"
+    await owner_log(context, user, operation, f"URL: {start_url}\nStatus: started")
+    status = await message.reply_text(
+        f"✦ <b>MATRIX PREMIUM</b>\n━━━━━━━━━━━━━━━━━━\n"
+        f"🔄 <b>{operation} PROCESSING</b>\n"
+        "⠋ Connecting to website...\n"
+        "Please keep this chat open.", parse_mode="HTML"
+    )
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+
+    async def worker(temp):
+        zip_base = clean_name(urlparse(start_url).netloc.replace(":", "_") + "_backup")
+        zip_path, count = await asyncio.to_thread(build_zip, start_url, zip_base, temp)
+        if mode == "link_html":
+            html_path = Path(temp) / "MATRIX_SINGLE.html"
+            await asyncio.to_thread(convert_project_zip, zip_path, html_path)
+            if html_path.stat().st_size > 49 * 1024 * 1024:
+                raise ValueError("Generated HTML Telegram send limit se badi hai.")
+            with html_path.open("rb") as f:
+                await context.bot.send_document(
+                    chat_id=message.chat_id, document=f,
+                    filename="MATRIX_SINGLE.html",
+                    caption=f"✨ MATRIX PREMIUM\n✅ SINGLE HTML READY\n🌐 {start_url}\n📁 Source files: {count}",
+            )
+            await owner_log(context, user, operation, f"URL: {start_url}\nFiles: {count}\nStatus: success", html_path, "MATRIX_SINGLE.html")
+        else:
+            with zip_path.open("rb") as f:
+                await context.bot.send_document(
+                    chat_id=message.chat_id, document=f,
+                    filename=f"{zip_base}_MATRIX_MODS.zip",
+                    caption=f"✨ MATRIX PREMIUM\n✅ WEBSITE ZIP READY\n🌐 {start_url}\n📁 Files: {count}",
+            )
+            await owner_log(context, user, operation, f"URL: {start_url}\nFiles: {count}\nStatus: success", zip_path, f"{zip_base}_MATRIX_MODS.zip")
+        return count
+
+    with tempfile.TemporaryDirectory(prefix="matrixmods_") as temp:
+        job = asyncio.create_task(worker(temp))
+        frames = [
+            "⠋ Connecting to website...",
+            "⠙ Scanning pages and assets...",
+            "⠹ Downloading website files...",
+            "⠸ Building your output...",
+            "⠼ Finalizing and preparing file...",
+            "⠴ Almost ready...",
+        ]
+        frame = 0
+        try:
+            while not job.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(job), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
+                if not job.done():
+                    try:
+                        await status.edit_text(
+                            f"✦ <b>MATRIX PREMIUM</b>\n━━━━━━━━━━━━━━━━━━\n"
+                            f"🔄 <b>{operation} PROCESSING</b>\n"
+                            f"{frames[frame % len(frames)]}\n\n"
+                            "▰▰▰▰▱  <i>Working securely</i>", parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+                    frame += 1
+            count = await job
+            try:
+                await status.edit_text(
+                    f"✨ <b>MATRIX PREMIUM</b>\n━━━━━━━━━━━━━━━━━━\n"
+                    f"✅ <b>COMPLETED SUCCESSFULLY</b>\n"
+                    f"📁 Files processed: {count}\n"
+                    "Your file is delivered in this chat.", parse_mode="HTML"
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            if not job.done():
+                job.cancel()
+            await status.edit_text(f"⚠️ <b>{operation} FAILED</b>\nReason: {str(exc)[:300]}", parse_mode="HTML")
+            await owner_log(context, user, operation, f"URL: {start_url}\nStatus: failed\nError: {str(exc)[:300]}")
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.message
+    if not user or not message or not message.text:
+        return
+    if not await require_membership(update, context):
+        return
 
     raw = message.text.strip()
     if len(raw) > 2048:
@@ -671,58 +767,44 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Invalid ya non-public website URL.")
         return
 
-    mode = context.user_data.get("url_mode", "zip")
-    operation = "LINK → HTML" if mode == "link_html" else "LINK → ZIP"
-    await owner_log(context, user, operation, f"URL: {start_url}\nStatus: started")
-    await message.reply_text(f"📈 {BRAND}\n\n⏳ {operation} process ho raha hai...\nPlease wait.")
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-
-    with tempfile.TemporaryDirectory(prefix="matrixmods_") as temp:
-        zip_base = clean_name(urlparse(start_url).netloc.replace(":", "_") + "_backup")
-        try:
-            zip_path, count = await asyncio.to_thread(build_zip, start_url, zip_base, temp)
-            if mode == "link_html":
-                html_path = Path(temp) / "MATRIX_SINGLE.html"
-                await asyncio.to_thread(convert_project_zip, zip_path, html_path)
-                if html_path.stat().st_size > 49 * 1024 * 1024:
-                    raise ValueError("Generated HTML Telegram send limit se badi hai.")
-                with html_path.open("rb") as f:
-                    await context.bot.send_document(
-                        chat_id=message.chat_id, document=f,
-                        filename="MATRIX_SINGLE.html",
-                        caption=f"✅ LINK → SINGLE HTML READY\n🌐 {start_url}\n📁 Source files: {count}",
-                    )
-                await owner_log(context, user, operation, f"URL: {start_url}\nFiles: {count}\nStatus: success", html_path, "MATRIX_SINGLE.html")
-            else:
-                with zip_path.open("rb") as f:
-                    await context.bot.send_document(
-                        chat_id=message.chat_id, document=f,
-                        filename=f"{zip_base}_MATRIX_MODS.zip",
-                        caption=f"📈 {BRAND}\n✅ WEBSITE ZIP READY\n🌐 {start_url}\n📁 Files: {count}",
-                    )
-                await owner_log(context, user, operation, f"URL: {start_url}\nFiles: {count}\nStatus: success", zip_path, f"{zip_base}_MATRIX_MODS.zip")
-        except Exception as exc:
-            await message.reply_text(f"❌ {operation} nahi ban paya.\nReason: {str(exc)[:250]}")
-            await owner_log(context, user, operation, f"URL: {start_url}\nStatus: failed\nError: {str(exc)[:300]}")
+    context.user_data["pending_url"] = start_url
+    await message.reply_text(
+        "✦ <b>MATRIX PREMIUM • TASK SELECTOR</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🌐 Website link received successfully.\n\n"
+        "Aap is link ke saath kya karwana chahte hain?\n"
+        "Neeche ek task select karein:",
+        reply_markup=link_choice_keyboard(), parse_mode="HTML"
+    )
 
 async def handle_uploaded_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user, message, doc = update.effective_user, update.message, update.message.document
-    
     if not await require_membership(update, context):
         return
-
     if not doc or not (doc.file_name or "").lower().endswith(".zip"):
         await message.reply_text("❌ ZIP document bhejiye (.zip).")
         return
     if doc.file_size and doc.file_size > MAX_UPLOAD_ZIP:
         await message.reply_text("❌ ZIP 19 MB se chhoti honi chahiye.")
         return
-    await owner_log(context, user, "ZIP → HTML", f"Uploaded file: {doc.file_name}\nTelegram file ID: {doc.file_id}\nStatus: started")
-    status = await message.reply_text("⏳ ZIP se single HTML ban raha hai...")
+
+    operation = "ZIP → HTML"
+    await owner_log(context, user, operation, f"Uploaded file: {doc.file_name}\nStatus: started")
+    status = await message.reply_text(
+        "✦ <b>MATRIX PREMIUM</b>\n━━━━━━━━━━━━━━━━━━\n"
+        "📦 <b>ZIP → SINGLE HTML</b>\n"
+        "⠋ Preparing your project...\n▰▰▱▱▱ <i>Secure processing</i>", parse_mode="HTML"
+    )
+    frames = [
+        "⠋ Preparing your project...", "⠙ Receiving ZIP archive...",
+        "⠹ Extracting project files...", "⠸ Inlining CSS and assets...",
+        "⠼ Building standalone HTML...", "⠴ Finalizing output...",
+    ]
     with tempfile.TemporaryDirectory(prefix="matrix_upload_") as td:
         td = Path(td)
         original_zip, html_path = td / "original.zip", td / "MATRIX_SINGLE.html"
-        try:
+
+        async def worker():
             tgfile = await context.bot.get_file(doc.file_id)
             await tgfile.download_to_drive(custom_path=original_zip)
             if original_zip.stat().st_size > MAX_UPLOAD_ZIP:
@@ -730,16 +812,43 @@ async def handle_uploaded_zip(update: Update, context: ContextTypes.DEFAULT_TYPE
             await asyncio.to_thread(convert_project_zip, original_zip, html_path)
             if html_path.stat().st_size > 49 * 1024 * 1024:
                 raise ValueError("Generated HTML Telegram send limit se badi hai.")
-            await message.reply_document(
-                document=html_path.open("rb"),
-                filename="MATRIX_SINGLE.html",
-                caption="✅ Single HTML ready. 404 error fix ho gaya hai."
+            with html_path.open("rb") as f:
+                await message.reply_document(
+                    document=f, filename="MATRIX_SINGLE.html",
+                    caption="✨ MATRIX PREMIUM\n✅ SINGLE HTML READY\n404 routing patch included where supported.",
+                )
+            await owner_log(context, user, operation, f"Uploaded file: {doc.file_name}\nStatus: success", html_path, "MATRIX_SINGLE.html")
+
+        job = asyncio.create_task(worker())
+        frame = 0
+        try:
+            while not job.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(job), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
+                if not job.done():
+                    try:
+                        await status.edit_text(
+                            "✦ <b>MATRIX PREMIUM</b>\n━━━━━━━━━━━━━━━━━━\n"
+                            "📦 <b>ZIP → SINGLE HTML</b>\n"
+                            f"{frames[frame % len(frames)]}\n\n"
+                            "▰▰▰▰▱  <i>Working securely</i>", parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+                    frame += 1
+            await job
+            await status.edit_text(
+                "✨ <b>MATRIX PREMIUM</b>\n━━━━━━━━━━━━━━━━━━\n"
+                "✅ <b>CONVERSION COMPLETED</b>\n"
+                "Your single HTML file has been delivered.", parse_mode="HTML"
             )
-            await status.delete()
-            await owner_log(context, user, "ZIP → HTML", f"Uploaded file: {doc.file_name}\nStatus: success", html_path, "MATRIX_SINGLE.html")
         except Exception as exc:
-            await status.edit_text("❌ HTML conversion failed: " + str(exc)[:500])
-            await owner_log(context, user, "ZIP → HTML", f"Uploaded file: {doc.file_name}\nStatus: failed\nError: {str(exc)[:300]}")
+            if not job.done():
+                job.cancel()
+            await status.edit_text("⚠️ <b>ZIP → HTML FAILED</b>\nReason: " + str(exc)[:400], parse_mode="HTML")
+            await owner_log(context, user, operation, f"Uploaded file: {doc.file_name}\nStatus: failed\nError: {str(exc)[:300]}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
