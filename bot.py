@@ -259,6 +259,51 @@ def local_asset(base_dir, value, root):
         path = (base_dir / decoded).resolve()
     return path if path.is_file() and (path == root or root in path.parents) else None
 
+def resolve_iframe_html(base_dir, value, root):
+    """Resolve iframe HTML, including versioned files such as panel_v_114.html
+    when the page requests panel.html?v=114.
+    """
+    exact = local_asset(base_dir, value, root)
+    if exact and exact.suffix.lower() in (".html", ".htm"):
+        return exact
+
+    requested = (value or "").strip().split("#", 1)[0].split("?", 1)[0]
+    requested = unquote(requested).replace("\\", "/")
+    basename = Path(requested.lstrip("/")).name
+    stem = Path(basename).stem
+    suffix = Path(basename).suffix.lower()
+    if suffix not in (".html", ".htm"):
+        return None
+
+    # Common build output: panel.html?v=114 is shipped as panel_v_114.html.
+    dirs = []
+    if requested.startswith("/"):
+        dirs.append((root / Path(requested.lstrip("/")).parent).resolve())
+    else:
+        dirs.append((base_dir / Path(requested).parent).resolve())
+    dirs.append(root.resolve())
+
+    candidates = []
+    seen_dirs = set()
+    for directory in dirs:
+        if directory in seen_dirs or not directory.is_dir():
+            continue
+        seen_dirs.add(directory)
+        candidates.extend(directory.glob(stem + "_v_*" + suffix))
+        candidates.extend(directory.glob(stem + "-v-*" + suffix))
+    if not candidates:
+        # Allow nested ZIP layouts, but only matching versioned page names.
+        candidates.extend(root.rglob(stem + "_v_*" + suffix))
+        candidates.extend(root.rglob(stem + "-v-*" + suffix))
+    candidates = [p.resolve() for p in candidates if p.is_file() and (p.resolve() == root.resolve() or root.resolve() in p.resolve().parents)]
+    if not candidates:
+        return None
+
+    def version_key(path):
+        nums = re.findall(r"\d+", path.stem)
+        return tuple(int(n) for n in nums) if nums else (0,)
+    return sorted(candidates, key=lambda p: (version_key(p), str(p).lower()), reverse=True)[0]
+
 def inline_css_assets(css, css_path, root, seen=None):
     seen = seen or set()
     import_re = re.compile(r"""@import\s+(?:url\()?["']?([^"')\s;]+)["']?\)?\s*;""", re.I)
@@ -291,7 +336,7 @@ class SingleHTMLInliner(HTMLParser):
         # Recursively inline local iframe HTML (for example /panel.html).
         # A depth limit prevents circular iframe references.
         if tag_lower == "iframe" and values.get("src") and self.depth < 8:
-            iframe_page = local_asset(self.entry.parent, values["src"], self.root)
+            iframe_page = resolve_iframe_html(self.entry.parent, values["src"], self.root)
             if iframe_page and iframe_page.suffix.lower() in (".html", ".htm"):
                 try:
                     child = SingleHTMLInliner(
