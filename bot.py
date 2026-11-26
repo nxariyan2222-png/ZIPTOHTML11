@@ -455,9 +455,14 @@ def convert_project_zip(zip_path, output_path):
             
         def entry_rank(p):
             n = p.name.lower()
-            priority = 0 if n == "index.html" else 1 if n == "index.htm" else 2 if n == "main.html" else 3
-            return (priority, len(p.relative_to(root).parts), str(p).lower())
-            
+            # If the project contains a versioned panel page, emit that page itself
+            # as the final single HTML (not index.html with the panel in an iframe).
+            panel_versioned = re.match(r"^panel_v_(\d+)\.(?:html|htm)$", n)
+            if panel_versioned:
+                return (0, -int(panel_versioned.group(1)), len(p.relative_to(root).parts), str(p).lower())
+            priority = 1 if n == "index.html" else 2 if n == "index.htm" else 3 if n == "main.html" else 4
+            return (priority, 0, len(p.relative_to(root).parts), str(p).lower())
+
         all_html.sort(key=entry_rank)
         entry = all_html[0]
         site_root = root.resolve()
