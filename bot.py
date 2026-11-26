@@ -14,6 +14,7 @@ import time
 import zipfile
 import base64
 import mimetypes
+import html as html_lib
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urldefrag, unquote
 from urllib.request import Request
@@ -275,15 +276,44 @@ def inline_css_assets(css, css_path, root, seen=None):
     return url_re.sub(replace_url, css)
 
 class SingleHTMLInliner(HTMLParser):
-    def __init__(self, source, entry, root):
+    def __init__(self, source, entry, root, depth=0, asset_map=None, import_map=None):
         super().__init__(convert_charrefs=False)
         self.entry, self.root, self.output = entry, root, []
+        self.depth = depth
+        self.asset_map = asset_map or {}
+        self.import_map = import_map or {}
         self.feed(source)
 
     def handle_starttag(self, tag, attrs):
         values = dict(attrs)
         tag_lower = tag.lower()
         
+        # Recursively inline local iframe HTML (for example /panel.html).
+        # A depth limit prevents circular iframe references.
+        if tag_lower == "iframe" and values.get("src") and self.depth < 8:
+            iframe_page = local_asset(self.entry.parent, values["src"], self.root)
+            if iframe_page and iframe_page.suffix.lower() in (".html", ".htm"):
+                try:
+                    child = SingleHTMLInliner(
+                        iframe_page.read_text("utf-8", errors="replace"),
+                        iframe_page, self.root, self.depth + 1,
+                        self.asset_map, self.import_map,
+                    )
+                    child_html = "".join(child.output)
+                    bridge = "<script>window.__ASSET_MAP__=" + json.dumps(self.asset_map) + r""";
+(function(){var f=window.fetch;window.fetch=function(i,o){var u=typeof i==="string"?i:i.url;return f.call(this,window.__ASSET_MAP__[u]||u,o)};
+var x=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){arguments[1]=window.__ASSET_MAP__[u]||u;return x.apply(this,arguments)};})();</script>"""
+                    if self.import_map:
+                        bridge = '<script type="importmap">' + json.dumps({"imports": self.import_map}) + "</script>" + bridge
+                    if re.search(r"</head\\s*>", child_html, re.I):
+                        child_html = re.sub(r"</head\\s*>", lambda m: bridge + m.group(0), child_html, count=1, flags=re.I)
+                    else:
+                        child_html = "<head>" + bridge + "</head>" + child_html
+                    values.pop("src", None)
+                    values["srcdoc"] = child_html
+                except Exception:
+                    pass
+
         # Ignore Vite modulepreload to stop missing asset errors
         if tag_lower == "link" and values.get("rel") == "modulepreload":
             return
@@ -330,7 +360,7 @@ class SingleHTMLInliner(HTMLParser):
             values["srcset"] = ", ".join(candidates)
             
         attrs_text = "".join(
-            (' %s="%s"' % (k, (v or "").replace("&", "&amp;").replace('"', "&quot;")))
+            (' %s="%s"' % (k, (v or "").replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")))
             if v is not None else " " + k for k, v in values.items()
         )
         self.output.append("<%s%s>" % (tag, attrs_text))
@@ -385,9 +415,9 @@ def convert_project_zip(zip_path, output_path):
             
         all_html.sort(key=entry_rank)
         entry = all_html[0]
-        site_root = entry.parent.resolve()
+        site_root = root.resolve()
         
-        parser = SingleHTMLInliner(entry.read_text("utf-8", errors="replace"), entry, site_root)
+        parser = SingleHTMLInliner(entry.read_text("utf-8", errors="replace"), entry, site_root, asset_map=asset_map, import_map=import_map)
         result = "".join(parser.output)
         
         # 2. Ultimate Router & Fetch Hijack (Works in Chrome & Telegram)
